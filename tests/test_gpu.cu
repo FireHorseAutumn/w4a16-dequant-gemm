@@ -17,6 +17,10 @@
 //      bitwise dequant through w_out, oracle at 1e-3, cuBLAS cross-check at
 //      2e-3. Ragged-K and partial-tile configs exercise the shared-memory
 //      zero padding.
+//   6. MXFP4 kernels (dequant_mx, fused_kernel_mx, mma_kernel_mx): the same
+//      gate set against the MXFP4 host reference — bitwise dequant, oracle
+//      at 1e-3, cuBLAS at 2e-3, entry contracts including the 2^31 bound on
+//      the naive dequant launch.
 
 #include <cstdio>
 #include <cstring>
@@ -25,6 +29,7 @@
 #include "w4/dequant.cuh"
 #include "w4/fused.cuh"
 #include "w4/mma.cuh"
+#include "w4/mxfused.cuh"
 
 struct Cfg {
   int M, N, K, gs;
@@ -241,6 +246,174 @@ int main() {
     }
   }
 
+  // MXFP4 (E2M1 + E8M0 block scale): the same gate set applied to the MX
+  // kernels — dequant_mx bitwise vs the host reference, fused/MMA dequant
+  // bitwise through w_out, GEMM vs the FP64 oracle at 1e-3, vs cuBLAS at
+  // 2e-3. The gs column of cfgs is unused here: the MX block is fixed at
+  // 32, and K in {72, 100, 104, 40} exercises partial blocks and ragged
+  // word tails.
+  for (size_t i = 0; i < cfgs.size(); ++i) {
+    const Cfg c = cfgs[i];
+    const uint64_t seed = 0x1E4AULL ^ (uint64_t)(i * 977);
+    const auto w_src = w4::normal_weights(c.N * c.K, seed);
+    const w4::mx::PackedWm p = w4::mx::quantize_mx(w_src, c.N, c.K);
+    const auto w_ref = w4::mx::dequant_all_mx(p);
+    const auto x = w4::normal_activations(c.M * c.K, seed + 1);
+
+    uint32_t* q_d = nullptr;
+    uint8_t* se_d = nullptr;
+    __half *w_d = nullptr, *x_d = nullptr, *c_d = nullptr, *c_f = nullptr;
+    w4::gpu::cuda_check(
+        cudaMalloc(&q_d, p.q.size() * sizeof(uint32_t)), "malloc mx q");
+    w4::gpu::cuda_check(
+        cudaMalloc(&se_d, p.scales.size() * sizeof(uint8_t)),
+        "malloc mx scales");
+    w4::gpu::cuda_check(
+        cudaMalloc(&w_d, (size_t)c.N * c.K * sizeof(__half)), "malloc mx w");
+    w4::gpu::cuda_check(
+        cudaMalloc(&x_d, (size_t)c.M * c.K * sizeof(__half)), "malloc mx x");
+    w4::gpu::cuda_check(
+        cudaMalloc(&c_d, (size_t)c.M * c.N * sizeof(__half)), "malloc mx c");
+    w4::gpu::cuda_check(
+        cudaMalloc(&c_f, (size_t)c.M * c.N * sizeof(__half)), "malloc mx cf");
+
+    w4::gpu::cuda_check(cudaMemcpy(q_d, p.q.data(),
+                                   p.q.size() * sizeof(uint32_t),
+                                   cudaMemcpyHostToDevice),
+                        "up mx q");
+    w4::gpu::cuda_check(cudaMemcpy(se_d, p.scales.data(),
+                                   p.scales.size() * sizeof(uint8_t),
+                                   cudaMemcpyHostToDevice),
+                        "up mx scales");
+    w4::gpu::cuda_check(cudaMemcpy(x_d, x.data(),
+                                   (size_t)c.M * c.K * sizeof(__half),
+                                   cudaMemcpyHostToDevice),
+                        "up mx x");
+
+    const w4::gpu::DevicePackedWm dp{c.N, c.K, p.B, q_d, se_d};
+    w4::gpu::dequant_mx(dp, w_d);
+    w4::gpu::cuda_check(cudaDeviceSynchronize(), "mx dequant sync");
+
+    std::vector<__half> w_gpu((size_t)c.N * c.K);
+    w4::gpu::cuda_check(cudaMemcpy(w_gpu.data(), w_d,
+                                   (size_t)c.N * c.K * sizeof(__half),
+                                   cudaMemcpyDeviceToHost),
+                        "down mx w");
+    ++checks;
+    if (std::memcmp(w_gpu.data(), w_ref.data(),
+                    (size_t)c.N * c.K * sizeof(__half)) != 0) {
+      ++fails;
+      std::printf("FAIL mx dequant bitwise N=%d K=%d\n", c.N, c.K);
+    }
+
+    w4::gpu::gemm_fp16(cb, w_d, x_d, c_d, c.M, c.N, c.K);
+    w4::gpu::cuda_check(cudaDeviceSynchronize(), "mx gemm sync");
+    std::vector<__half> c_gpu((size_t)c.M * c.N);
+    w4::gpu::cuda_check(cudaMemcpy(c_gpu.data(), c_d,
+                                   (size_t)c.M * c.N * sizeof(__half),
+                                   cudaMemcpyDeviceToHost),
+                        "down mx c");
+    const auto c_ref = w4::gemm_oracle(x, c.M, c.K, w_ref, c.N);
+    double den = 0.0;
+    for (size_t j = 0; j < c_ref.size(); ++j) den += c_ref[j] * c_ref[j];
+
+    // Fused MX: w_out bitwise, then GEMM gates.
+    w4::gpu::gemm_fused_mx(dp, x_d, c_f, c.M, 0, w_d);
+    w4::gpu::cuda_check(cudaDeviceSynchronize(), "mx fused w_out sync");
+    w4::gpu::cuda_check(cudaMemcpy(w_gpu.data(), w_d,
+                                   (size_t)c.N * c.K * sizeof(__half),
+                                   cudaMemcpyDeviceToHost),
+                        "down mx w fused");
+    ++checks;
+    if (std::memcmp(w_gpu.data(), w_ref.data(),
+                    (size_t)c.N * c.K * sizeof(__half)) != 0) {
+      ++fails;
+      std::printf("FAIL mx fused dequant bitwise M=%d N=%d K=%d\n", c.M, c.N,
+                  c.K);
+    }
+    w4::gpu::gemm_fused_mx(dp, x_d, c_f, c.M);
+    w4::gpu::cuda_check(cudaDeviceSynchronize(), "mx fused sync");
+    std::vector<__half> c_fused((size_t)c.M * c.N);
+    w4::gpu::cuda_check(cudaMemcpy(c_fused.data(), c_f,
+                                   (size_t)c.M * c.N * sizeof(__half),
+                                   cudaMemcpyDeviceToHost),
+                        "down mx c fused");
+    double num_f = 0.0, num_x = 0.0;
+    for (size_t j = 0; j < c_ref.size(); ++j) {
+      const double d = (double)__half2float(c_fused[j]) - c_ref[j];
+      num_f += d * d;
+      const double dx =
+          (double)__half2float(c_fused[j]) - (double)__half2float(c_gpu[j]);
+      num_x += dx * dx;
+    }
+    const double rel_f = std::sqrt(num_f / (den > 0.0 ? den : 1.0));
+    const double rel_x = std::sqrt(num_x / (den > 0.0 ? den : 1.0));
+    worst_rel = std::max(worst_rel, rel_f);
+    ++checks;
+    if (rel_f > 1e-3) {
+      ++fails;
+      std::printf("FAIL mx fused gemm M=%d N=%d K=%d rel=%.3e\n", c.M, c.N,
+                  c.K, rel_f);
+    }
+    ++checks;
+    if (rel_x > 2e-3) {
+      ++fails;
+      std::printf("FAIL mx fused-vs-cublas M=%d N=%d K=%d rel=%.3e\n", c.M,
+                  c.N, c.K, rel_x);
+    }
+
+    // MMA MX: same gates.
+    w4::gpu::gemm_mma_mx(dp, x_d, c_f, c.M, 0, w_d);
+    w4::gpu::cuda_check(cudaDeviceSynchronize(), "mx mma w_out sync");
+    w4::gpu::cuda_check(cudaMemcpy(w_gpu.data(), w_d,
+                                   (size_t)c.N * c.K * sizeof(__half),
+                                   cudaMemcpyDeviceToHost),
+                        "down mx w mma");
+    ++checks;
+    if (std::memcmp(w_gpu.data(), w_ref.data(),
+                    (size_t)c.N * c.K * sizeof(__half)) != 0) {
+      ++fails;
+      std::printf("FAIL mx mma dequant bitwise M=%d N=%d K=%d\n", c.M, c.N,
+                  c.K);
+    }
+    w4::gpu::gemm_mma_mx(dp, x_d, c_f, c.M);
+    w4::gpu::cuda_check(cudaDeviceSynchronize(), "mx mma sync");
+    w4::gpu::cuda_check(cudaMemcpy(c_fused.data(), c_f,
+                                   (size_t)c.M * c.N * sizeof(__half),
+                                   cudaMemcpyDeviceToHost),
+                        "down mx c mma");
+    double num_m = 0.0, num_mx = 0.0;
+    for (size_t j = 0; j < c_ref.size(); ++j) {
+      const double d = (double)__half2float(c_fused[j]) - c_ref[j];
+      num_m += d * d;
+      const double dx =
+          (double)__half2float(c_fused[j]) - (double)__half2float(c_gpu[j]);
+      num_mx += dx * dx;
+    }
+    const double rel_m = std::sqrt(num_m / (den > 0.0 ? den : 1.0));
+    const double rel_mx = std::sqrt(num_mx / (den > 0.0 ? den : 1.0));
+    worst_rel = std::max(worst_rel, rel_m);
+    ++checks;
+    if (rel_m > 1e-3) {
+      ++fails;
+      std::printf("FAIL mx mma gemm M=%d N=%d K=%d rel=%.3e\n", c.M, c.N,
+                  c.K, rel_m);
+    }
+    ++checks;
+    if (rel_mx > 2e-3) {
+      ++fails;
+      std::printf("FAIL mx mma-vs-cublas M=%d N=%d K=%d rel=%.3e\n", c.M, c.N,
+                  c.K, rel_mx);
+    }
+
+    cudaFree(q_d);
+    cudaFree(se_d);
+    cudaFree(w_d);
+    cudaFree(x_d);
+    cudaFree(c_d);
+    cudaFree(c_f);
+  }
+
   cublasDestroy(cb);
 
   // Host-side entry contracts: every malformed launch must throw before any
@@ -345,7 +518,43 @@ int main() {
            "mma x null");
     expect(throws_invalid([&] { w4::gpu::gemm_mma(good, out, nullptr, 2); }),
            "mma c null");
->>>>>>> aec7135 (W4A16 R3: fused dequant + WMMA — the M=64 loss is gone (0.43x -> 1.68x))
+
+    // MX entry contracts: dims, B-vs-K consistency, null pointers, M, and
+    // the 2^31 launch bound on the naive dequant.
+    const w4::gpu::DevicePackedWm good_mx{2, 32, 1, (const uint32_t*)1,
+                                          (const uint8_t*)1};
+    auto bad_mxn = good_mx; bad_mxn.N = 0;
+    auto bad_mxb = good_mx; bad_mxb.B = 2;
+    auto bad_mxq = good_mx; bad_mxq.q = nullptr;
+    auto bad_mxs = good_mx; bad_mxs.scales = nullptr;
+    auto big_mx = good_mx; big_mx.N = 1 << 21; big_mx.K = 8192;
+    big_mx.B = 256;
+    expect(throws_invalid([&] { w4::gpu::dequant_mx(bad_mxn, out); }),
+           "mx dequant N=0");
+    expect(throws_invalid([&] { w4::gpu::dequant_mx(bad_mxb, out); }),
+           "mx dequant B wrong");
+    expect(throws_invalid([&] { w4::gpu::dequant_mx(bad_mxq, out); }),
+           "mx dequant q null");
+    expect(throws_invalid([&] { w4::gpu::dequant_mx(bad_mxs, out); }),
+           "mx dequant scales null");
+    expect(throws_invalid([&] { w4::gpu::dequant_mx(good_mx, nullptr); }),
+           "mx dequant w null");
+    expect(throws_invalid([&] { w4::gpu::dequant_mx(big_mx, out); }),
+           "mx dequant total >= 2^31");
+    expect(throws_invalid([&] { w4::gpu::gemm_fused_mx(bad_mxb, out, out, 2); }),
+           "mx fused B wrong");
+    expect(throws_invalid([&] { w4::gpu::gemm_fused_mx(good_mx, nullptr, out, 2); }),
+           "mx fused x null");
+    expect(throws_invalid([&] { w4::gpu::gemm_fused_mx(good_mx, out, nullptr, 2); }),
+           "mx fused c null");
+    expect(throws_invalid([&] { w4::gpu::gemm_fused_mx(good_mx, out, out, 0); }),
+           "mx fused M=0");
+    expect(throws_invalid([&] { w4::gpu::gemm_mma_mx(bad_mxb, out, out, 2); }),
+           "mx mma B wrong");
+    expect(throws_invalid([&] { w4::gpu::gemm_mma_mx(good_mx, nullptr, out, 2); }),
+           "mx mma x null");
+    expect(throws_invalid([&] { w4::gpu::gemm_mma_mx(good_mx, out, out, 0); }),
+           "mx mma M=0");
   }
 
   std::printf("gpu: %d checks, %d failures, worst gemm rel L2 = %.3e\n",

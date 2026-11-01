@@ -1,9 +1,10 @@
 # W4A16 Fused Dequant GEMM
 
-**STATUS: R3 complete — WMMA/tensor-core fused kernel landed and gated;
-it removes the SIMT M=64 loss (0.43x -> 1.68x vs baseline) and is flat
-1.4-2.0x across M (staging-latency bound; double-buffering is the next
-lever). SIMT fused stays the winner at M <= 16. Pinned rerun owed.**
+**STATUS: R4 complete — MXFP4 kernel rung (naive two-pass, fused SIMT,
+fused WMMA) gated on the full matrix; same dispatch picture as W4 (SIMT
+wins M <= 16, MMA wins M=64). Format-accuracy figure recorded: MXFP4 and
+W4A16 gs=128 symmetric land at the same rel L2 on Gaussian weights.
+Pinned rerun owed.**
 
 ## The kernel
 
@@ -59,6 +60,64 @@ Symmetric dequant: `w = scale * (q - 8)`; asymmetric: `w = scale * (q - z)`.
   `data/w4a16_baseline_bench.json`. Bandwidth figures are analytic bytes
   moved / time, labeled; the GEMM byte count is the analytic minimum.
 
+## R4 contents (2026-10-31 — MXFP4)
+
+- `include/w4/mx.hpp` — MXFP4 (E2M1 elements + E8M0 power-of-two block
+  scale, 32-element blocks): packed format, host quantizer with a
+  no-saturation scale rule, reference dequant. This is a different
+  arithmetic from W4 (table lookup + exponent shift, no zero-point), so it
+  gets its own header.
+- Host gates live in `test_oracle.cpp`: per-element bounds (measured worst
+  exactly saturates the nearest-rounding bound), the no-saturation
+  invariant, ragged and single-element blocks, sign handling, degenerate
+  all-zero blocks, a hand-computed pin, and the throw contracts.
+- `include/w4/mxfused.cuh` — the kernel rung: naive dequant (the MX
+  two-pass denominator), fused SIMT (`gemm_fused_mx`), and fused WMMA
+  (`gemm_mma_mx`). The mapping, x staging, dispatch, and store guards
+  follow the `fused.cuh` / `mma.cuh` skeletons unchanged; only the scale
+  fetch (one E8M0 byte per 4 words) and the dequant step differ, so the
+  R2/R3 performance conclusions carry over instead of being re-derived.
+- The measured dequant lesson: `dequant_one_mx` is semantically a table
+  lookup, but a function-local LUT indexed by a runtime nibble lands in
+  local memory on device and cost the fused SIMT kernel ~7-8x end-to-end
+  (M=1 went 0.71x -> 5.61x). The fix is a branch-free arithmetic decode of
+  E2M1 (exponent field and mantissa split; every table value is exactly
+  representable), which keeps host and device bitwise-identical.
+- Gates: the full set on both MX paths — dequant bitwise vs
+  `dequant_all_mx`, fused/MMA dequant bitwise through `w_out`, GEMM vs the
+  FP64 oracle at rel L2 <= 1e-3, vs cuBLAS at 2e-3, entry-throw contracts
+  (dims, B-vs-K consistency, nulls, M, the 2^31 naive-dequant launch
+  bound). Partial 32-element blocks and ragged word tails are covered by
+  the K in {72, 100, 104, 40} configs. CTest 2/2 (271 checks), zero
+  warnings.
+- `benchmarks/bench_mx.cu` — MX two-pass vs fused vs MMA, same session,
+  same shapes as `bench_fused`; raw reps + metadata in
+  `data/w4a16_mx_bench.json`. Each case also records the format-accuracy
+  figure: rel L2 of dequant(quant(W)) vs the FP64 source, MXFP4 vs W4A16
+  gs=128 symmetric, on identical data.
+
+## R4 numbers (2026-10-31, RTX 5060 Laptop, UNPINNED powersave governor)
+
+Same-session triad 264.4 GB/s; MX two-pass baseline re-measured in
+session. SIMT-fused / MMA ratios vs baseline:
+
+| M | SIMT N=4096 | SIMT N=14336 | MMA N=4096 | MMA N=14336 |
+|---|---|---|---|---|
+| 1 | 5.61x | 6.55x | 1.37x | 1.87x |
+| 8 | 1.99x | 2.48x | 1.31x | 1.88x |
+| 16 | 1.14x | 1.33x | 1.32x | 1.78x |
+| 64 | 0.34x | 0.33x | 1.34x | 1.49x |
+
+The W4 dispatch picture reproduces on a different dequant arithmetic:
+SIMT wins decode shapes (M <= 16), MMA removes the M=64 loss. MX fused
+SIMT runs a few points under its W4 counterpart (5.61x vs 5.76x at M=1,
+N=4096) — the scale-byte fetch per four words plus the decode ALU.
+Quantization accuracy on Gaussian weights: MXFP4 rel L2 1.15e-1 vs W4A16
+gs=128 symmetric 1.17e-1 — parity on this distribution; MX's finer blocks
+(32 vs 128 elements) do not buy accuracy here because the E8M0 scale is a
+bare power of two where W4's is FP16. One distribution, one seed set; not
+a general format ranking. A pinned-governor rerun of all of this is owed.
+
 ## R3 contents (2026-10-31, same day — separate commit)
 
 - `include/w4/mma.cuh` — fused dequant + WMMA GEMM (`gemm_mma`). Block
@@ -97,8 +156,8 @@ double-buffering (cp.async / register prefetch), recorded as the next
 lever. Tile-shape A/Bs were run and rejected (chunk 64 doubles the
 x-staging footprint; N-tile 32 halves W work per chunk while x staging
 stays fixed). Best-of-dispatch vs baseline: SIMT M=1 7.5/7.7x, M=8
-2.2/2.9x, M=16 1.4/1.6x; MMA M=64 1.4/1.7x. The pinned MEAS-2 rerun is
-the authority on all of this.
+2.2/2.9x, M=16 1.4/1.6x; MMA M=64 1.4/1.7x. A pinned-governor rerun is
+owed and is the authority on all of this.
 
 ## R2 contents (2026-10-31)
 
@@ -109,9 +168,10 @@ the authority on all of this.
   is converted to FP32 once per call (per-FMA `__half2float` re-conversion
   measured as the binding constraint without it). MTILE/R dispatch:
   M <= 4 -> (pow2(M), 1); M > 4 -> (4, 4) — 128 regs, no spills, 2
-  blocks/SM. MTILE 16/32/64 were measured and rejected (occupancy,
-  register spills, shared-staging bank conflicts). The same `dequant_one` call is the whole
-  dequant path, so the bitwise gate below applies unchanged.
+  blocks/SM. MTILE 16/32/64 were measured and rejected (94 regs halves
+  occupancy; 148 regs drops to 1 block/SM; 255 spills). The same
+  `dequant_one` call is the whole dequant path, so the bitwise gate below
+  applies unchanged.
 - Gates (CTest 2/2, zero warnings): everything R1 gated, plus fused
   dequant bitwise vs `dequant_all` through the `w_out` hook across the
   same matrix (including M > 16 configs for the m-tiling guards), fused

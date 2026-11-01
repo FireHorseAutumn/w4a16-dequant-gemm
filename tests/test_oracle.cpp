@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <vector>
 
+#include "w4/mx.hpp"
 #include "w4/pack.hpp"
 
 struct Cfg {
@@ -139,6 +140,160 @@ int main() {
                              std::vector<__half>(4), 1);
            }),
            "oracle size mismatch");
+  }
+
+  // ---- MXFP4 (E2M1 + E8M0 block scale) host gates ----
+  // Per-element error bounds against the exact quantization interval
+  // (half the wider neighboring code spacing), the no-saturation
+  // invariant, ragged blocks, degenerate blocks, a hand-computed pin, and
+  // the throw contracts.
+  {
+    const std::vector<Cfg> mcfgs = {
+        {1, 64, 64, 0},   {8, 128, 96, 0},  {16, 256, 100, 0},  // ragged K
+        {4, 96, 72, 0},   {2, 32, 33, 0},   // block of 1 element
+        {3, 40, 256, 0},  {5, 72, 40, 0},
+    };
+    for (size_t i = 0; i < mcfgs.size(); ++i) {
+      const Cfg c = mcfgs[i];
+      const uint64_t seed = 0x9E4FULL ^ (uint64_t)(i * 977);
+      const auto w = w4::normal_weights(c.N * c.K, seed);
+      const w4::mx::PackedWm p = w4::mx::quantize_mx(w, c.N, c.K);
+      const auto wd = w4::mx::dequant_all_mx(p);
+
+      double worst = 0.0;
+      for (int n = 0; n < c.N; ++n)
+        for (int k = 0; k < c.K; ++k) {
+          const uint8_t se = p.scales[(size_t)n * p.B + k / 32];
+          const double s = std::ldexp(1.0, (int)se - 127);
+          const int q = w4::mx::get_q(p, n, k);
+          const int idx = q & 7;
+          // wider of the two neighboring code spacings, halved
+          const double left =
+              idx > 0 ? (double)(w4::mx::kE2M1[idx] - w4::mx::kE2M1[idx - 1])
+                      : 0.5;
+          const double right =
+              idx < 7 ? (double)(w4::mx::kE2M1[idx + 1] - w4::mx::kE2M1[idx])
+                      : left;
+          const double tol = 0.5 * std::max(left, right) * s + 1e-12;
+          const double err =
+              std::fabs((double)__half2float(wd[(size_t)n * c.K + k]) -
+                        w[(size_t)n * c.K + k]);
+          worst = std::max(worst, err / tol);
+          ++checks;
+          if (err > tol) {
+            ++fails;
+            std::printf("FAIL mx N=%d K=%d n=%d k=%d: |wd-w|=%.3e > %.3e\n",
+                        c.N, c.K, n, k, err, tol);
+          }
+        }
+      // No-saturation invariant: no block's amax exceeds 6 * scale.
+      for (int n = 0; n < c.N; ++n)
+        for (int b = 0; b < p.B; ++b) {
+          const int k0 = b * 32, k1 = std::min(c.K, k0 + 32);
+          double amax = 0.0;
+          for (int k = k0; k < k1; ++k)
+            amax = std::max(amax, std::fabs(w[(size_t)n * c.K + k]));
+          const double s =
+              std::ldexp(1.0, (int)p.scales[(size_t)n * p.B + b] - 127);
+          ++checks;
+          if (amax > 6.0 * s * (1.0 + 1e-12)) {
+            ++fails;
+            std::printf("FAIL mx saturation N=%d K=%d n=%d b=%d\n", c.N,
+                        c.K, n, b);
+          }
+        }
+      std::printf("mx N=%d K=%d: worst err/tol = %.3f\n", c.N, c.K, worst);
+    }
+
+    // Hand pin: a block of all 3.0 -> amax 3, e = ceil(log2(0.5)) = -1,
+    // scale byte 126, every code = 7 (magnitude 6.0), dequant exact 3.0.
+    {
+      const std::vector<double> w(64, 3.0);
+      const auto p = w4::mx::quantize_mx(w, 2, 32);
+      ++checks;
+      if (p.scales[0] != 126 || p.scales[1] != 126) {
+        ++fails;
+        std::printf("FAIL mx pin scale: got %d, %d\n", (int)p.scales[0],
+                    (int)p.scales[1]);
+      }
+      const auto wd = w4::mx::dequant_all_mx(p);
+      ++checks;
+      if (__half2float(wd[0]) != 3.0f || __half2float(wd[63]) != 3.0f) {
+        ++fails;
+        std::printf("FAIL mx pin value: got %g\n", (double)__half2float(wd[0]));
+      }
+      ++checks;
+      if (w4::mx::get_q(p, 0, 0) != 7) {
+        ++fails;
+        std::printf("FAIL mx pin code: got %d\n", w4::mx::get_q(p, 0, 0));
+      }
+    }
+
+    // Sign handling: an all-negative block must produce negative codes.
+    {
+      const std::vector<double> w(32, -2.0);
+      const auto p = w4::mx::quantize_mx(w, 1, 32);
+      const auto wd = w4::mx::dequant_all_mx(p);
+      ++checks;
+      if (__half2float(wd[0]) != -2.0f || (w4::mx::get_q(p, 0, 0) & 8) == 0) {
+        ++fails;
+        std::printf("FAIL mx sign: got %g code %d\n",
+                    (double)__half2float(wd[0]), w4::mx::get_q(p, 0, 0));
+      }
+    }
+
+    // Degenerate all-zero input: no NaN scales, all-zero codes.
+    {
+      const std::vector<double> w(64 * 64, 0.0);
+      const auto p = w4::mx::quantize_mx(w, 64, 64);
+      const auto wd = w4::mx::dequant_all_mx(p);
+      bool bad = false;
+      for (const auto& v : wd)
+        if (__half2float(v) != 0.0f) bad = true;
+      ++checks;
+      if (bad) {
+        ++fails;
+        std::printf("FAIL mx zero input: nonzero dequant\n");
+      }
+    }
+
+    // Throw contracts: NaN, E8M0 overflow, dims, size.
+    {
+      auto throws_invalid = [](auto&& f) {
+        try {
+          f();
+        } catch (const std::invalid_argument&) {
+          return true;
+        } catch (...) {
+        }
+        return false;
+      };
+      auto expect = [&](bool ok, const char* name) {
+        ++checks;
+        if (!ok) {
+          ++fails;
+          std::printf("FAIL mx no-throw: %s\n", name);
+        }
+      };
+      const std::vector<double> ok(64 * 64, 0.5);
+      expect(throws_invalid([&] { w4::mx::quantize_mx(ok, 0, 64); }),
+             "mx N=0");
+      expect(throws_invalid(
+                 [&] { w4::mx::quantize_mx(std::vector<double>(10), 64, 64); }),
+             "mx size mismatch");
+      auto bad = ok;
+      bad[3] = std::nan("");
+      expect(throws_invalid([&] { w4::mx::quantize_mx(bad, 64, 64); }),
+             "mx NaN");
+      bad[3] = 1e300;  // block scale would need e > 127
+      expect(throws_invalid([&] { w4::mx::quantize_mx(bad, 64, 64); }),
+             "mx scale overflow");
+      auto p = w4::mx::quantize_mx(ok, 64, 64);
+      auto bad_sizes = p;
+      bad_sizes.q.resize(3);
+      expect(throws_invalid([&] { w4::mx::dequant_all_mx(bad_sizes); }),
+             "mx dequant size");
+    }
   }
 
   std::printf("oracle: %d checks, %d failures\n", checks, fails);
