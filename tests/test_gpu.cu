@@ -35,6 +35,7 @@
 #include "w4/dequant.cuh"
 #include "w4/fused.cuh"
 #include "w4/kvattention.cuh"
+#include "w4/kvflash.cuh"
 #include "w4/mma.cuh"
 #include "w4/mxfused.cuh"
 
@@ -601,6 +602,93 @@ int main() {
                       sym ? "sym" : "asym", c.H, c.S, c.D, c.gs, rel_t);
         }
 
+        // Flash (split-S) variants, same gates: hooks bitwise vs
+        // dequant_head, output vs the FP64 reference at 1e-3, vs the
+        // single-block kernels at 2e-3 (tile reduction order differs;
+        // both are gated paths).
+        w4::gpu::attention_w4_flash(dp, q_d, o_d, 0, ko_d, vo_d);
+        w4::gpu::cuda_check(cudaDeviceSynchronize(), "kv flash hooks");
+        bool fk_ok = true, fv_ok = true;
+        for (int h = 0; h < c.H; ++h) {
+          const auto kref = w4::kv::dequant_head(cc, h, false);
+          const auto vref = w4::kv::dequant_head(cc, h, true);
+          w4::gpu::cuda_check(cudaMemcpy(buf.data(),
+                                         ko_d + (size_t)h * c.S * c.D,
+                                         (size_t)c.S * c.D * sizeof(__half),
+                                         cudaMemcpyDeviceToHost),
+                              "down kv fko");
+          if (std::memcmp(buf.data(), kref.data(),
+                          (size_t)c.S * c.D * sizeof(__half)) != 0)
+            fk_ok = false;
+          w4::gpu::cuda_check(cudaMemcpy(buf.data(),
+                                         vo_d + (size_t)h * c.S * c.D,
+                                         (size_t)c.S * c.D * sizeof(__half),
+                                         cudaMemcpyDeviceToHost),
+                              "down kv fvo");
+          if (std::memcmp(buf.data(), vref.data(),
+                          (size_t)c.S * c.D * sizeof(__half)) != 0)
+            fv_ok = false;
+        }
+        ++checks;
+        if (!fk_ok || !fv_ok) {
+          ++fails;
+          std::printf("FAIL kv flash dequant bitwise %s H=%d S=%d D=%d\n",
+                      sym ? "sym" : "asym", c.H, c.S, c.D);
+        }
+        w4::gpu::attention_fp16_flash(q_d, k16_d, v16_d, o16_d, c.H, c.S,
+                                      c.D);
+        w4::gpu::cuda_check(cudaDeviceSynchronize(), "kv fp16 flash sync");
+        std::vector<__half> o_fw4((size_t)c.H * c.D), o_f16((size_t)c.H * c.D);
+        w4::gpu::cuda_check(cudaMemcpy(o_fw4.data(), o_d,
+                                       (size_t)c.H * c.D * sizeof(__half),
+                                       cudaMemcpyDeviceToHost),
+                            "down kv fw4");
+        w4::gpu::cuda_check(cudaMemcpy(o_f16.data(), o16_d,
+                                       (size_t)c.H * c.D * sizeof(__half),
+                                       cudaMemcpyDeviceToHost),
+                            "down kv f16");
+        double num_fw = 0.0, num_fc = 0.0, num_f6r = 0.0, num_f6c = 0.0;
+        for (size_t j = 0; j < o_fw4.size(); ++j) {
+          const double fw = (double)__half2float(o_fw4[j]);
+          const double f6 = (double)__half2float(o_f16[j]);
+          const double w4b = (double)__half2float(o_gpu[j]);
+          const double f16b = (double)__half2float(o_16[j]);
+          num_fw += (fw - ref[j]) * (fw - ref[j]);
+          num_fc += (fw - w4b) * (fw - w4b);
+          num_f6r += (f6 - ref[j]) * (f6 - ref[j]);
+          num_f6c += (f6 - f16b) * (f6 - f16b);
+        }
+        const double rel_fw = std::sqrt(num_fw / (den > 0.0 ? den : 1.0));
+        const double rel_fc = std::sqrt(num_fc / (den > 0.0 ? den : 1.0));
+        const double rel_f6r = std::sqrt(num_f6r / (den > 0.0 ? den : 1.0));
+        const double rel_f6c = std::sqrt(num_f6c / (den > 0.0 ? den : 1.0));
+        ++checks;
+        if (rel_fw > 1e-3) {
+          ++fails;
+          std::printf("FAIL kv flash oracle %s H=%d S=%d D=%d rel=%.3e\n",
+                      sym ? "sym" : "asym", c.H, c.S, c.D, rel_fw);
+        }
+        ++checks;
+        if (rel_fc > 2e-3) {
+          ++fails;
+          std::printf(
+              "FAIL kv flash-vs-singleblock %s H=%d S=%d D=%d rel=%.3e\n",
+              sym ? "sym" : "asym", c.H, c.S, c.D, rel_fc);
+        }
+        ++checks;
+        if (rel_f6r > 1e-3) {
+          ++fails;
+          std::printf("FAIL fp16 flash oracle %s H=%d S=%d D=%d rel=%.3e\n",
+                      sym ? "sym" : "asym", c.H, c.S, c.D, rel_f6r);
+        }
+        ++checks;
+        if (rel_f6c > 2e-3) {
+          ++fails;
+          std::printf(
+              "FAIL fp16 flash-vs-singleblock %s H=%d S=%d D=%d rel=%.3e\n",
+              sym ? "sym" : "asym", c.H, c.S, c.D, rel_f6c);
+        }
+
         cudaFree(qk_d);
         cudaFree(qv_d);
         cudaFree(zk_d);
@@ -615,6 +703,303 @@ int main() {
         cudaFree(ko_d);
         cudaFree(vo_d);
       }
+    }
+  }
+
+  // Flash-only configs beyond the old single-block bound: S > 4096
+  // exercises the tiling (and attention_w4 rejects these by contract, so
+  // the FP64 reference gates the flash path directly).
+  {
+    struct KvCfg {
+      int H, S, D, gs;
+    };
+    const std::vector<KvCfg> kcfgs = {{2, 5000, 64, 32}, {1, 9000, 128, 64}};
+    for (const bool sym : {true, false}) {
+      for (size_t i = 0; i < kcfgs.size(); ++i) {
+        const KvCfg c = kcfgs[i];
+        const uint64_t seed = 0x51D0ULL ^ (uint64_t)(i * 977 + (sym ? 0 : 1));
+        const auto k_src = w4::normal_weights(c.H * c.S * c.D, seed);
+        const auto v_src = w4::normal_weights(c.H * c.S * c.D, seed + 1);
+        const auto cc =
+            w4::kv::quantize_cache(k_src, v_src, c.H, c.S, c.D, c.gs, sym);
+        const auto q = w4::normal_activations(c.H * c.D, seed + 2);
+        const auto ref = w4::kv::attention_reference(q, cc);
+
+        const int wd = w4::words(c.D);
+        const size_t nq = (size_t)c.H * c.S * wd;
+        const size_t ns = (size_t)c.H * c.S * cc.G;
+        const size_t nz = (size_t)c.H * c.S * w4::words(cc.G);
+        const size_t ne = (size_t)c.H * c.S * c.D;
+        uint32_t *qk_d = nullptr, *qv_d = nullptr, *zk_d = nullptr,
+                 *zv_d = nullptr;
+        __half *sk_d = nullptr, *sv_d = nullptr, *q_d = nullptr,
+               *o_d = nullptr, *ko_d = nullptr, *vo_d = nullptr;
+        w4::gpu::cuda_check(cudaMalloc(&qk_d, nq * sizeof(uint32_t)),
+                            "fl qk");
+        w4::gpu::cuda_check(cudaMalloc(&qv_d, nq * sizeof(uint32_t)),
+                            "fl qv");
+        w4::gpu::cuda_check(cudaMalloc(&sk_d, ns * sizeof(__half)), "fl sk");
+        w4::gpu::cuda_check(cudaMalloc(&sv_d, ns * sizeof(__half)), "fl sv");
+        if (!sym) {
+          w4::gpu::cuda_check(cudaMalloc(&zk_d, nz * sizeof(uint32_t)),
+                              "fl zk");
+          w4::gpu::cuda_check(cudaMalloc(&zv_d, nz * sizeof(uint32_t)),
+                              "fl zv");
+        }
+        w4::gpu::cuda_check(
+            cudaMalloc(&q_d, (size_t)c.H * c.D * sizeof(__half)), "fl q");
+        w4::gpu::cuda_check(
+            cudaMalloc(&o_d, (size_t)c.H * c.D * sizeof(__half)), "fl o");
+        w4::gpu::cuda_check(cudaMalloc(&ko_d, ne * sizeof(__half)), "fl ko");
+        w4::gpu::cuda_check(cudaMalloc(&vo_d, ne * sizeof(__half)), "fl vo");
+        w4::gpu::cuda_check(cudaMemcpy(qk_d, cc.q_k.data(),
+                                       nq * sizeof(uint32_t),
+                                       cudaMemcpyHostToDevice),
+                            "up fl qk");
+        w4::gpu::cuda_check(cudaMemcpy(qv_d, cc.q_v.data(),
+                                       nq * sizeof(uint32_t),
+                                       cudaMemcpyHostToDevice),
+                            "up fl qv");
+        w4::gpu::cuda_check(cudaMemcpy(sk_d, cc.s_k.data(),
+                                       ns * sizeof(__half),
+                                       cudaMemcpyHostToDevice),
+                            "up fl sk");
+        w4::gpu::cuda_check(cudaMemcpy(sv_d, cc.s_v.data(),
+                                       ns * sizeof(__half),
+                                       cudaMemcpyHostToDevice),
+                            "up fl sv");
+        if (!sym) {
+          w4::gpu::cuda_check(cudaMemcpy(zk_d, cc.z_k.data(),
+                                         nz * sizeof(uint32_t),
+                                         cudaMemcpyHostToDevice),
+                              "up fl zk");
+          w4::gpu::cuda_check(cudaMemcpy(zv_d, cc.z_v.data(),
+                                         nz * sizeof(uint32_t),
+                                         cudaMemcpyHostToDevice),
+                              "up fl zv");
+        }
+        w4::gpu::cuda_check(cudaMemcpy(q_d, q.data(),
+                                       (size_t)c.H * c.D * sizeof(__half),
+                                       cudaMemcpyHostToDevice),
+                            "up fl q");
+
+        const w4::gpu::DeviceKVW4 dp{c.H,    c.S,    c.D, c.gs, cc.G,
+                                     sym ? 1 : 0,    qk_d,  sk_d, zk_d,
+                                     qv_d,   sv_d,   zv_d};
+        w4::gpu::attention_w4_flash(dp, q_d, o_d, 0, ko_d, vo_d);
+        w4::gpu::cuda_check(cudaDeviceSynchronize(), "fl hooks sync");
+        std::vector<__half> buf(ne);
+        bool k_ok = true, v_ok = true;
+        for (int h = 0; h < c.H; ++h) {
+          const auto kref = w4::kv::dequant_head(cc, h, false);
+          const auto vref = w4::kv::dequant_head(cc, h, true);
+          w4::gpu::cuda_check(cudaMemcpy(buf.data(),
+                                         ko_d + (size_t)h * c.S * c.D,
+                                         (size_t)c.S * c.D * sizeof(__half),
+                                         cudaMemcpyDeviceToHost),
+                              "down fl ko");
+          if (std::memcmp(buf.data(), kref.data(),
+                          (size_t)c.S * c.D * sizeof(__half)) != 0)
+            k_ok = false;
+          w4::gpu::cuda_check(cudaMemcpy(buf.data(),
+                                         vo_d + (size_t)h * c.S * c.D,
+                                         (size_t)c.S * c.D * sizeof(__half),
+                                         cudaMemcpyDeviceToHost),
+                              "down fl vo");
+          if (std::memcmp(buf.data(), vref.data(),
+                          (size_t)c.S * c.D * sizeof(__half)) != 0)
+            v_ok = false;
+        }
+        ++checks;
+        if (!k_ok || !v_ok) {
+          ++fails;
+          std::printf("FAIL flash big-S dequant bitwise %s H=%d S=%d D=%d\n",
+                      sym ? "sym" : "asym", c.H, c.S, c.D);
+        }
+        std::vector<__half> o_gpu((size_t)c.H * c.D);
+        w4::gpu::cuda_check(cudaMemcpy(o_gpu.data(), o_d,
+                                       (size_t)c.H * c.D * sizeof(__half),
+                                       cudaMemcpyDeviceToHost),
+                            "down fl o");
+        double num = 0.0, den = 0.0;
+        for (size_t j = 0; j < o_gpu.size(); ++j) {
+          const double d = (double)__half2float(o_gpu[j]) - ref[j];
+          num += d * d;
+          den += ref[j] * ref[j];
+        }
+        const double rel = std::sqrt(num / (den > 0.0 ? den : 1.0));
+        worst_rel = std::max(worst_rel, rel);
+        ++checks;
+        if (rel > 1e-3) {
+          ++fails;
+          std::printf("FAIL flash big-S oracle %s H=%d S=%d D=%d rel=%.3e\n",
+                      sym ? "sym" : "asym", c.H, c.S, c.D, rel);
+        }
+        cudaFree(qk_d);
+        cudaFree(qv_d);
+        cudaFree(zk_d);
+        cudaFree(zv_d);
+        cudaFree(sk_d);
+        cudaFree(sv_d);
+        cudaFree(q_d);
+        cudaFree(o_d);
+        cudaFree(ko_d);
+        cudaFree(vo_d);
+      }
+    }
+  }
+
+  // FP8 (E4M3) KV cache, flash path (R6): hooks bitwise vs
+  // dequant_head_f8, output vs the FP64 reference at 1e-3, vs the device
+  // two-pass (per-head dequant_f8 + FP16 flash attention) at 2e-3. The
+  // S=9000 config is beyond the old single-block bound on purpose.
+  {
+    struct KvCfg {
+      int H, S, D, gs;
+    };
+    const std::vector<KvCfg> kcfgs = {
+        {1, 1, 64, 32},    {2, 7, 64, 8},   {4, 128, 128, 128},
+        {2, 300, 96, 32},  {3, 65, 40, 8},  {1, 9000, 128, 64},
+    };
+    for (size_t i = 0; i < kcfgs.size(); ++i) {
+      const KvCfg c = kcfgs[i];
+      const uint64_t seed = 0xF80AULL ^ (uint64_t)(i * 977);
+      const auto k_src = w4::normal_weights(c.H * c.S * c.D, seed);
+      const auto v_src = w4::normal_weights(c.H * c.S * c.D, seed + 1);
+      const auto cc =
+          w4::kv8::quantize_cache_f8(k_src, v_src, c.H, c.S, c.D, c.gs);
+      const auto q = w4::normal_activations(c.H * c.D, seed + 2);
+      const auto ref = w4::kv8::attention_reference_f8(q, cc);
+
+      const size_t ne = (size_t)c.H * c.S * c.D;
+      const size_t ns = (size_t)c.H * c.S * cc.G;
+      uint8_t *qk_d = nullptr, *qv_d = nullptr;
+      __half *sk_d = nullptr, *sv_d = nullptr, *q_d = nullptr,
+             *o_d = nullptr, *o16_d = nullptr, *k16_d = nullptr,
+             *v16_d = nullptr, *ko_d = nullptr, *vo_d = nullptr;
+      w4::gpu::cuda_check(cudaMalloc(&qk_d, ne), "f8 qk");
+      w4::gpu::cuda_check(cudaMalloc(&qv_d, ne), "f8 qv");
+      w4::gpu::cuda_check(cudaMalloc(&sk_d, ns * sizeof(__half)), "f8 sk");
+      w4::gpu::cuda_check(cudaMalloc(&sv_d, ns * sizeof(__half)), "f8 sv");
+      w4::gpu::cuda_check(
+          cudaMalloc(&q_d, (size_t)c.H * c.D * sizeof(__half)), "f8 q");
+      w4::gpu::cuda_check(
+          cudaMalloc(&o_d, (size_t)c.H * c.D * sizeof(__half)), "f8 o");
+      w4::gpu::cuda_check(
+          cudaMalloc(&o16_d, (size_t)c.H * c.D * sizeof(__half)), "f8 o16");
+      w4::gpu::cuda_check(cudaMalloc(&k16_d, ne * sizeof(__half)), "f8 k16");
+      w4::gpu::cuda_check(cudaMalloc(&v16_d, ne * sizeof(__half)), "f8 v16");
+      w4::gpu::cuda_check(cudaMalloc(&ko_d, ne * sizeof(__half)), "f8 ko");
+      w4::gpu::cuda_check(cudaMalloc(&vo_d, ne * sizeof(__half)), "f8 vo");
+      w4::gpu::cuda_check(cudaMemcpy(qk_d, cc.q_k.data(), ne,
+                                     cudaMemcpyHostToDevice),
+                          "up f8 qk");
+      w4::gpu::cuda_check(cudaMemcpy(qv_d, cc.q_v.data(), ne,
+                                     cudaMemcpyHostToDevice),
+                          "up f8 qv");
+      w4::gpu::cuda_check(cudaMemcpy(sk_d, cc.s_k.data(),
+                                     ns * sizeof(__half),
+                                     cudaMemcpyHostToDevice),
+                          "up f8 sk");
+      w4::gpu::cuda_check(cudaMemcpy(sv_d, cc.s_v.data(),
+                                     ns * sizeof(__half),
+                                     cudaMemcpyHostToDevice),
+                          "up f8 sv");
+      w4::gpu::cuda_check(cudaMemcpy(q_d, q.data(),
+                                     (size_t)c.H * c.D * sizeof(__half),
+                                     cudaMemcpyHostToDevice),
+                          "up f8 q");
+
+      const w4::gpu::DeviceKVF8 dp{c.H, c.S,  c.D,  c.gs, cc.G,
+                                   qk_d, sk_d, qv_d, sv_d};
+      w4::gpu::attention_f8_flash(dp, q_d, o_d, 0, ko_d, vo_d);
+      w4::gpu::cuda_check(cudaDeviceSynchronize(), "f8 hooks sync");
+      std::vector<__half> buf(ne);
+      bool k_ok = true, v_ok = true;
+      for (int h = 0; h < c.H; ++h) {
+        const auto kref = w4::kv8::dequant_head_f8(cc, h, false);
+        const auto vref = w4::kv8::dequant_head_f8(cc, h, true);
+        w4::gpu::cuda_check(cudaMemcpy(buf.data(),
+                                       ko_d + (size_t)h * c.S * c.D,
+                                       (size_t)c.S * c.D * sizeof(__half),
+                                       cudaMemcpyDeviceToHost),
+                            "down f8 ko");
+        if (std::memcmp(buf.data(), kref.data(),
+                        (size_t)c.S * c.D * sizeof(__half)) != 0)
+          k_ok = false;
+        w4::gpu::cuda_check(cudaMemcpy(buf.data(),
+                                       vo_d + (size_t)h * c.S * c.D,
+                                       (size_t)c.S * c.D * sizeof(__half),
+                                       cudaMemcpyDeviceToHost),
+                            "down f8 vo");
+        if (std::memcmp(buf.data(), vref.data(),
+                        (size_t)c.S * c.D * sizeof(__half)) != 0)
+          v_ok = false;
+      }
+      ++checks;
+      if (!k_ok || !v_ok) {
+        ++fails;
+        std::printf("FAIL f8 dequant bitwise H=%d S=%d D=%d gs=%d\n", c.H,
+                    c.S, c.D, c.gs);
+      }
+
+      // Two-pass: per-head FP8 dequant, then the FP16 flash kernel.
+      for (int h = 0; h < c.H; ++h) {
+        w4::gpu::dequant_f8(qk_d + (size_t)h * c.S * c.D,
+                            sk_d + (size_t)h * c.S * cc.G,
+                            k16_d + (size_t)h * c.S * c.D, c.S, c.D, c.gs);
+        w4::gpu::dequant_f8(qv_d + (size_t)h * c.S * c.D,
+                            sv_d + (size_t)h * c.S * cc.G,
+                            v16_d + (size_t)h * c.S * c.D, c.S, c.D, c.gs);
+      }
+      w4::gpu::attention_fp16_flash(q_d, k16_d, v16_d, o16_d, c.H, c.S, c.D);
+      w4::gpu::cuda_check(cudaDeviceSynchronize(), "f8 twopass sync");
+
+      std::vector<__half> o_gpu((size_t)c.H * c.D), o_2p((size_t)c.H * c.D);
+      w4::gpu::cuda_check(cudaMemcpy(o_gpu.data(), o_d,
+                                     (size_t)c.H * c.D * sizeof(__half),
+                                     cudaMemcpyDeviceToHost),
+                          "down f8 o");
+      w4::gpu::cuda_check(cudaMemcpy(o_2p.data(), o16_d,
+                                     (size_t)c.H * c.D * sizeof(__half),
+                                     cudaMemcpyDeviceToHost),
+                          "down f8 o2p");
+      double num_r = 0.0, num_t = 0.0, den = 0.0;
+      for (size_t j = 0; j < o_gpu.size(); ++j) {
+        const double d = (double)__half2float(o_gpu[j]) - ref[j];
+        num_r += d * d;
+        const double dt =
+            (double)__half2float(o_gpu[j]) - (double)__half2float(o_2p[j]);
+        num_t += dt * dt;
+        den += ref[j] * ref[j];
+      }
+      const double rel_r = std::sqrt(num_r / (den > 0.0 ? den : 1.0));
+      const double rel_t = std::sqrt(num_t / (den > 0.0 ? den : 1.0));
+      worst_rel = std::max(worst_rel, rel_r);
+      ++checks;
+      if (rel_r > 1e-3) {
+        ++fails;
+        std::printf("FAIL f8 oracle H=%d S=%d D=%d gs=%d rel=%.3e\n", c.H,
+                    c.S, c.D, c.gs, rel_r);
+      }
+      ++checks;
+      if (rel_t > 2e-3) {
+        ++fails;
+        std::printf("FAIL f8 two-pass H=%d S=%d D=%d gs=%d rel=%.3e\n", c.H,
+                    c.S, c.D, c.gs, rel_t);
+      }
+
+      cudaFree(qk_d);
+      cudaFree(qv_d);
+      cudaFree(sk_d);
+      cudaFree(sv_d);
+      cudaFree(q_d);
+      cudaFree(o_d);
+      cudaFree(o16_d);
+      cudaFree(k16_d);
+      cudaFree(v16_d);
+      cudaFree(ko_d);
+      cudaFree(vo_d);
     }
   }
 
@@ -830,6 +1215,100 @@ int main() {
     expect(throws_invalid(
                [&] { w4::gpu::attention_fp16(out, out, out, out, 1, 4, 513); }),
            "kv fp16 D bound");
+    // Flash entry contracts: dims, the D shared bound, gs/G, nulls, and the
+    // tile-grid S bound (65535 * 256). S > 4096 alone must NOT throw here —
+    // that is the point of the flash path — so only the tile bound is
+    // tested for rejection.
+    expect(throws_invalid([&] { w4::gpu::attention_w4_flash(kv_s0, out, out); }),
+           "kv flash S=0");
+    expect(throws_invalid(
+               [&] { w4::gpu::attention_w4_flash(kv_big_d, out, out); }),
+           "kv flash D=513");
+    expect(throws_invalid([&] { w4::gpu::attention_w4_flash(kv_gs, out, out); }),
+           "kv flash gs=7");
+    expect(throws_invalid([&] { w4::gpu::attention_w4_flash(kv_g, out, out); }),
+           "kv flash G wrong");
+    expect(throws_invalid([&] { w4::gpu::attention_w4_flash(kv_q, out, out); }),
+           "kv flash q null");
+    expect(throws_invalid([&] { w4::gpu::attention_w4_flash(kv_z, out, out); }),
+           "kv flash asym zeros null");
+    expect(throws_invalid(
+               [&] { w4::gpu::attention_w4_flash(kv_sz, out, out); }),
+           "kv flash sym carries zeros");
+    expect(throws_invalid(
+               [&] { w4::gpu::attention_w4_flash(good_kv, nullptr, out); }),
+           "kv flash x null");
+    expect(throws_invalid(
+               [&] { w4::gpu::attention_w4_flash(good_kv, out, nullptr); }),
+           "kv flash out null");
+    {
+      auto kv_past_tiles = good_kv;
+      kv_past_tiles.S = 65535 * 256 + 1;
+      expect(throws_invalid(
+                 [&] { w4::gpu::attention_w4_flash(kv_past_tiles, out, out); }),
+             "kv flash S past tile-grid bound");
+    }
+    expect(throws_invalid([&] {
+             w4::gpu::attention_fp16_flash(out, out, out, out, 1, 4, 513);
+           }),
+           "kv fp16 flash D bound");
+    expect(throws_invalid([&] {
+             w4::gpu::attention_fp16_flash(out, out, out, out, 1,
+                                           65535 * 256 + 1, 8);
+           }),
+           "kv fp16 flash S bound");
+    expect(throws_invalid([&] {
+             w4::gpu::attention_fp16_flash(nullptr, out, out, out, 1, 4, 8);
+           }),
+           "kv fp16 flash q null");
+    // FP8 flash entry contracts: dims, D bounds (shared stage and word
+    // alignment), gs, G, nulls, the tile-grid S bound, dequant_f8 rules.
+    const w4::gpu::DeviceKVF8 good_f8{1, 4, 8, 8, 2, (const uint8_t*)1,
+                                      (const __half*)1, (const uint8_t*)1,
+                                      (const __half*)1};
+    auto f8_s0 = good_f8; f8_s0.S = 0;
+    auto f8_bigd = good_f8; f8_bigd.D = 513;
+    auto f8_d2 = good_f8; f8_d2.D = 2; f8_d2.G = 1;  // D % 4 != 0
+    auto f8_gs = good_f8; f8_gs.gs = 7;
+    auto f8_g = good_f8; f8_g.G = 3;
+    auto f8_q = good_f8; f8_q.q_k = nullptr;
+    expect(throws_invalid(
+               [&] { w4::gpu::attention_f8_flash(f8_s0, out, out); }),
+           "f8 flash S=0");
+    expect(throws_invalid(
+               [&] { w4::gpu::attention_f8_flash(f8_bigd, out, out); }),
+           "f8 flash D=513");
+    expect(throws_invalid(
+               [&] { w4::gpu::attention_f8_flash(f8_d2, out, out); }),
+           "f8 flash D%4");
+    expect(throws_invalid(
+               [&] { w4::gpu::attention_f8_flash(f8_gs, out, out); }),
+           "f8 flash gs=7");
+    expect(throws_invalid(
+               [&] { w4::gpu::attention_f8_flash(f8_g, out, out); }),
+           "f8 flash G wrong");
+    expect(throws_invalid(
+               [&] { w4::gpu::attention_f8_flash(f8_q, out, out); }),
+           "f8 flash q null");
+    expect(throws_invalid(
+               [&] { w4::gpu::attention_f8_flash(good_f8, nullptr, out); }),
+           "f8 flash x null");
+    {
+      auto f8_big = good_f8;
+      f8_big.S = 65535 * 256 + 1;
+      expect(throws_invalid(
+                 [&] { w4::gpu::attention_f8_flash(f8_big, out, out); }),
+             "f8 flash S past tile-grid bound");
+    }
+    expect(throws_invalid(
+               [&] { w4::gpu::dequant_f8(nullptr, (const __half*)1, out, 4, 8, 8); }),
+           "f8 dequant q null");
+    expect(throws_invalid(
+               [&] { w4::gpu::dequant_f8((const uint8_t*)1, (const __half*)1, out, 4, 6, 8); }),
+           "f8 dequant D%4");
+    expect(throws_invalid(
+               [&] { w4::gpu::dequant_f8((const uint8_t*)1, (const __half*)1, out, 4, 8, 7); }),
+           "f8 dequant gs=7");
     expect(throws_invalid(
                [&] { w4::gpu::attention_fp16(nullptr, out, out, out, 1, 4, 8); }),
            "kv fp16 q null");

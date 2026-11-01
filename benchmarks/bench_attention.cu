@@ -1,10 +1,12 @@
-// KV-cache decode attention benchmark (R5): FP16-cache fused attention vs
-// W4-cache fused attention vs the two-pass (dequant both caches to FP16,
-// then FP16 attention). The two-pass is the fusion denominator; the FP16
-// fused path isolates the cache-bandwidth win — same kernel shape, 4x the
-// K/V bytes. Same session, raw per-rep timings preserved, FP64 triad as
-// the bandwidth reference. Byte counts are analytic minima, not measured
-// DRAM traffic.
+// KV-cache decode attention benchmark (R5/R5.5): single-block FP16-cache
+// fused vs single-block W4 fused vs the two-pass (dequant both caches to
+// FP16, then FP16 attention), plus the split-S flash paths for both cache
+// types. The single-block kernels reject S > 4096 by contract (the shared
+// scores bound); those cases time the flash paths alone, which is the
+// point of R5.5. The two-pass is the fusion denominator; the FP16 paths
+// isolate the cache-bandwidth win — same kernel shape, 4x the K/V bytes.
+// Same session, raw per-rep timings preserved, FP64 triad as the bandwidth
+// reference. Byte counts are analytic minima, not measured DRAM traffic.
 //
 // Correctness at bench size: the k_out/v_out hooks are checked bitwise
 // against dequant_head per case; the output oracle gate lives in test_gpu
@@ -20,6 +22,7 @@
 #include <vector>
 
 #include "w4/kvattention.cuh"
+#include "w4/kvflash.cuh"
 
 namespace {
 
@@ -91,9 +94,11 @@ struct Case {
 
 struct Result {
   Case c;
-  std::vector<double> fp16_ms, w4_ms, twopass_ms;
+  std::vector<double> fp16_ms, w4_ms, twopass_ms, flash16_ms, flashw4_ms,
+      flashf8_ms;
   bool hooks_bitwise;
   double vs_reference_rel;
+  double quant_rel_w4, quant_rel_f8;
 };
 
 Result run_case(const Case& c, int reps, uint64_t seed) {
@@ -103,6 +108,7 @@ Result run_case(const Case& c, int reps, uint64_t seed) {
   const auto k_src = normal_weights(c.H * c.S * c.D, seed);
   const auto v_src = normal_weights(c.H * c.S * c.D, seed + 1);
   const auto cc = kv::quantize_cache(k_src, v_src, c.H, c.S, c.D, c.gs, true);
+  const auto cc8 = kv8::quantize_cache_f8(k_src, v_src, c.H, c.S, c.D, c.gs);
   const auto q = normal_activations(c.H * c.D, seed + 2);
 
   const int wd = words(c.D);
@@ -110,11 +116,16 @@ Result run_case(const Case& c, int reps, uint64_t seed) {
   const size_t ns = (size_t)c.H * c.S * cc.G;
   const size_t ne = (size_t)c.H * c.S * c.D;
   uint32_t *qk_d, *qv_d;
-  __half *sk_d, *sv_d, *q_d, *o_d, *k16_d, *v16_d, *ko_d, *vo_d;
+  uint8_t *qk8_d, *qv8_d;
+  __half *sk_d, *sv_d, *sk8_d, *sv8_d, *q_d, *o_d, *k16_d, *v16_d, *ko_d, *vo_d;
   cuda_check(cudaMalloc(&qk_d, nq * sizeof(uint32_t)), "qk");
   cuda_check(cudaMalloc(&qv_d, nq * sizeof(uint32_t)), "qv");
   cuda_check(cudaMalloc(&sk_d, ns * sizeof(__half)), "sk");
   cuda_check(cudaMalloc(&sv_d, ns * sizeof(__half)), "sv");
+  cuda_check(cudaMalloc(&qk8_d, ne), "qk8");
+  cuda_check(cudaMalloc(&qv8_d, ne), "qv8");
+  cuda_check(cudaMalloc(&sk8_d, ns * sizeof(__half)), "sk8");
+  cuda_check(cudaMalloc(&sv8_d, ns * sizeof(__half)), "sv8");
   cuda_check(cudaMalloc(&q_d, (size_t)c.H * c.D * sizeof(__half)), "q");
   cuda_check(cudaMalloc(&o_d, (size_t)c.H * c.D * sizeof(__half)), "o");
   cuda_check(cudaMalloc(&k16_d, ne * sizeof(__half)), "k16");
@@ -133,35 +144,92 @@ Result run_case(const Case& c, int reps, uint64_t seed) {
   cuda_check(cudaMemcpy(sv_d, cc.s_v.data(), ns * sizeof(__half),
                         cudaMemcpyHostToDevice),
              "up sv");
+  cuda_check(cudaMemcpy(qk8_d, cc8.q_k.data(), ne, cudaMemcpyHostToDevice),
+             "up qk8");
+  cuda_check(cudaMemcpy(qv8_d, cc8.q_v.data(), ne, cudaMemcpyHostToDevice),
+             "up qv8");
+  cuda_check(cudaMemcpy(sk8_d, cc8.s_k.data(), ns * sizeof(__half),
+                        cudaMemcpyHostToDevice),
+             "up sk8");
+  cuda_check(cudaMemcpy(sv8_d, cc8.s_v.data(), ns * sizeof(__half),
+                        cudaMemcpyHostToDevice),
+             "up sv8");
   cuda_check(cudaMemcpy(q_d, q.data(), (size_t)c.H * c.D * sizeof(__half),
                         cudaMemcpyHostToDevice),
              "up q");
 
   const DeviceKVW4 dp{c.H, c.S, c.D, c.gs, cc.G, 1,
                       qk_d, sk_d, nullptr, qv_d, sv_d, nullptr};
+  const DeviceKVF8 dp8{c.H, c.S, c.D, c.gs, cc8.G, qk8_d, sk8_d,
+                       qv8_d, sv8_d};
 
   // Bitwise hook check plus one agreement figure vs the host reference.
-  attention_w4(dp, q_d, o_d, 0, ko_d, vo_d);
-  cuda_check(cudaDeviceSynchronize(), "hooks sync");
+  // The W4 flash path runs the hooks everywhere; the single-block path
+  // rejects S > 4096 by contract, so it runs the hooks only when in
+  // bounds. Each variant is checked against its own hook output.
+  const bool old_ok = c.S <= KV_MAX_S;
   std::vector<__half> buf(ne);
   bool hooks = true;
+  const int nvar = old_ok ? 3 : 2;
+  for (int variant = 0; variant < nvar; ++variant) {
+    if (variant == 0 && old_ok) {
+      attention_w4(dp, q_d, o_d, 0, ko_d, vo_d);
+      cuda_check(cudaDeviceSynchronize(), "hooks sync");
+    } else if (variant <= 1) {
+      attention_w4_flash(dp, q_d, o_d, 0, ko_d, vo_d);
+      cuda_check(cudaDeviceSynchronize(), "flash hooks sync");
+    } else {
+      attention_f8_flash(dp8, q_d, o_d, 0, ko_d, vo_d);
+      cuda_check(cudaDeviceSynchronize(), "f8 hooks sync");
+    }
+    for (int h = 0; h < c.H; ++h) {
+      const auto kref = variant == 2 ? kv8::dequant_head_f8(cc8, h, false)
+                                     : kv::dequant_head(cc, h, false);
+      const auto vref = variant == 2 ? kv8::dequant_head_f8(cc8, h, true)
+                                     : kv::dequant_head(cc, h, true);
+      cuda_check(cudaMemcpy(buf.data(), ko_d + (size_t)h * c.S * c.D,
+                            (size_t)c.S * c.D * sizeof(__half),
+                            cudaMemcpyDeviceToHost),
+                 "down ko");
+      if (std::memcmp(buf.data(), kref.data(),
+                      (size_t)c.S * c.D * sizeof(__half)) != 0)
+        hooks = false;
+      cuda_check(cudaMemcpy(buf.data(), vo_d + (size_t)h * c.S * c.D,
+                            (size_t)c.S * c.D * sizeof(__half),
+                            cudaMemcpyDeviceToHost),
+                 "down vo");
+      if (std::memcmp(buf.data(), vref.data(),
+                      (size_t)c.S * c.D * sizeof(__half)) != 0)
+        hooks = false;
+    }
+  }
+
+  // Format accuracy on identical data: rel L2 of dequant(quant(cache)) vs
+  // the FP64 source, W4 vs FP8, K and V together.
+  double qnum4 = 0.0, qnum8 = 0.0, qden = 0.0;
   for (int h = 0; h < c.H; ++h) {
-    const auto kref = kv::dequant_head(cc, h, false);
-    const auto vref = kv::dequant_head(cc, h, true);
-    cuda_check(cudaMemcpy(buf.data(), ko_d + (size_t)h * c.S * c.D,
-                          (size_t)c.S * c.D * sizeof(__half),
-                          cudaMemcpyDeviceToHost),
-               "down ko");
-    if (std::memcmp(buf.data(), kref.data(),
-                    (size_t)c.S * c.D * sizeof(__half)) != 0)
-      hooks = false;
-    cuda_check(cudaMemcpy(buf.data(), vo_d + (size_t)h * c.S * c.D,
-                          (size_t)c.S * c.D * sizeof(__half),
-                          cudaMemcpyDeviceToHost),
-               "down vo");
-    if (std::memcmp(buf.data(), vref.data(),
-                    (size_t)c.S * c.D * sizeof(__half)) != 0)
-      hooks = false;
+    const auto k4 = kv::dequant_head(cc, h, false);
+    const auto v4 = kv::dequant_head(cc, h, true);
+    const auto k8 = kv8::dequant_head_f8(cc8, h, false);
+    const auto v8 = kv8::dequant_head_f8(cc8, h, true);
+    const size_t off = (size_t)h * c.S * c.D;
+    for (size_t j = 0; j < (size_t)c.S * c.D; ++j) {
+      const double sk = k_src[off + j], sv_ = v_src[off + j];
+      const double dk4 = (double)__half2float(k4[j]) - sk;
+      const double dv4 = (double)__half2float(v4[j]) - sv_;
+      const double dk8 = (double)__half2float(k8[j]) - sk;
+      const double dv8 = (double)__half2float(v8[j]) - sv_;
+      qnum4 += dk4 * dk4 + dv4 * dv4;
+      qnum8 += dk8 * dk8 + dv8 * dv8;
+      qden += sk * sk + sv_ * sv_;
+    }
+  }
+  // The reference figure is the single-block W4 output vs the host
+  // reference where that path is in bounds, the flash output past it (the
+  // hooks loop left the flash output in o_d for the large-S cases).
+  if (old_ok) {
+    attention_w4(dp, q_d, o_d);
+    cuda_check(cudaDeviceSynchronize(), "w4 rel sync");
   }
   std::vector<__half> o_gpu((size_t)c.H * c.D);
   cuda_check(cudaMemcpy(o_gpu.data(), o_d, (size_t)c.H * c.D * sizeof(__half),
@@ -193,42 +261,73 @@ Result run_case(const Case& c, int reps, uint64_t seed) {
   r.c = c;
   r.hooks_bitwise = hooks;
   r.vs_reference_rel = std::sqrt(num / (den > 0.0 ? den : 1.0));
+  r.quant_rel_w4 = std::sqrt(qnum4 / (qden > 0.0 ? qden : 1.0));
+  r.quant_rel_f8 = std::sqrt(qnum8 / (qden > 0.0 ? qden : 1.0));
 
+  // The single-block kernels reject S > 4096 by contract (the shared
+  // scores bound); the flash paths carry those cases alone.
   for (int rep = -2; rep < reps; ++rep) {
     const auto t0 = std::chrono::steady_clock::now();
-    attention_fp16(q_d, k16_d, v16_d, o_d, c.H, c.S, c.D);
-    cuda_check(cudaDeviceSynchronize(), "fp16 sync");
-    const auto t1 = std::chrono::steady_clock::now();
-    attention_w4(dp, q_d, o_d);
-    cuda_check(cudaDeviceSynchronize(), "w4 sync");
-    const auto t2 = std::chrono::steady_clock::now();
-    // Two-pass e2e: dequant both caches (timed), then FP16 attention.
-    for (int h = 0; h < c.H; ++h) {
-      const DevicePackedW dk{c.S, c.D, c.gs, cc.G, 1,
-                             qk_d + (size_t)h * c.S * wd,
-                             sk_d + (size_t)h * c.S * cc.G, nullptr};
-      dequant(dk, k16_d + (size_t)h * c.S * c.D);
-      const DevicePackedW dv{c.S, c.D, c.gs, cc.G, 1,
-                             qv_d + (size_t)h * c.S * wd,
-                             sv_d + (size_t)h * c.S * cc.G, nullptr};
-      dequant(dv, v16_d + (size_t)h * c.S * c.D);
+    if (old_ok) {
+      attention_fp16(q_d, k16_d, v16_d, o_d, c.H, c.S, c.D);
+      cuda_check(cudaDeviceSynchronize(), "fp16 sync");
     }
-    attention_fp16(q_d, k16_d, v16_d, o_d, c.H, c.S, c.D);
-    cuda_check(cudaDeviceSynchronize(), "twopass sync");
+    const auto t1 = std::chrono::steady_clock::now();
+    if (old_ok) {
+      attention_w4(dp, q_d, o_d);
+      cuda_check(cudaDeviceSynchronize(), "w4 sync");
+    }
+    const auto t2 = std::chrono::steady_clock::now();
+    if (old_ok) {
+      // Two-pass e2e: dequant both caches (timed), then FP16 attention.
+      for (int h = 0; h < c.H; ++h) {
+        const DevicePackedW dk{c.S, c.D, c.gs, cc.G, 1,
+                               qk_d + (size_t)h * c.S * wd,
+                               sk_d + (size_t)h * c.S * cc.G, nullptr};
+        dequant(dk, k16_d + (size_t)h * c.S * c.D);
+        const DevicePackedW dv{c.S, c.D, c.gs, cc.G, 1,
+                               qv_d + (size_t)h * c.S * wd,
+                               sv_d + (size_t)h * c.S * cc.G, nullptr};
+        dequant(dv, v16_d + (size_t)h * c.S * c.D);
+      }
+      attention_fp16(q_d, k16_d, v16_d, o_d, c.H, c.S, c.D);
+      cuda_check(cudaDeviceSynchronize(), "twopass sync");
+    }
     const auto t3 = std::chrono::steady_clock::now();
+    attention_fp16_flash(q_d, k16_d, v16_d, o_d, c.H, c.S, c.D);
+    cuda_check(cudaDeviceSynchronize(), "fp16 flash sync");
+    const auto t4 = std::chrono::steady_clock::now();
+    attention_w4_flash(dp, q_d, o_d);
+    cuda_check(cudaDeviceSynchronize(), "w4 flash sync");
+    const auto t5 = std::chrono::steady_clock::now();
+    attention_f8_flash(dp8, q_d, o_d);
+    cuda_check(cudaDeviceSynchronize(), "f8 flash sync");
+    const auto t6 = std::chrono::steady_clock::now();
     if (rep < 0) continue;
-    r.fp16_ms.push_back(
-        std::chrono::duration<double, std::milli>(t1 - t0).count());
-    r.w4_ms.push_back(
-        std::chrono::duration<double, std::milli>(t2 - t1).count());
-    r.twopass_ms.push_back(
-        std::chrono::duration<double, std::milli>(t3 - t2).count());
+    if (old_ok) {
+      r.fp16_ms.push_back(
+          std::chrono::duration<double, std::milli>(t1 - t0).count());
+      r.w4_ms.push_back(
+          std::chrono::duration<double, std::milli>(t2 - t1).count());
+      r.twopass_ms.push_back(
+          std::chrono::duration<double, std::milli>(t3 - t2).count());
+    }
+    r.flash16_ms.push_back(
+        std::chrono::duration<double, std::milli>(t4 - t3).count());
+    r.flashw4_ms.push_back(
+        std::chrono::duration<double, std::milli>(t5 - t4).count());
+    r.flashf8_ms.push_back(
+        std::chrono::duration<double, std::milli>(t6 - t5).count());
   }
 
   cudaFree(qk_d);
   cudaFree(qv_d);
+  cudaFree(qk8_d);
+  cudaFree(qv8_d);
   cudaFree(sk_d);
   cudaFree(sv_d);
+  cudaFree(sk8_d);
+  cudaFree(sv8_d);
   cudaFree(q_d);
   cudaFree(o_d);
   cudaFree(k16_d);
@@ -270,10 +369,13 @@ int main(int argc, char** argv) {
   }
 
   // Decode-class shapes: MHA (H=32) and GQA (H=8) head counts, D=128,
-  // cache lengths from a context page to the shared-memory bound.
+  // cache lengths from a context page past the single-block S=4096 shared
+  // bound (the flash paths carry the S=8192/32768 cases alone).
   const std::vector<Case> cases = {
-      {32, 512, 128, 128},  {32, 2048, 128, 128}, {32, 4096, 128, 128},
-      {8, 512, 128, 128},   {8, 2048, 128, 128},  {8, 4096, 128, 128},
+      {32, 512, 128, 128},   {32, 2048, 128, 128},  {32, 4096, 128, 128},
+      {32, 8192, 128, 128},  {32, 32768, 128, 128},
+      {8, 512, 128, 128},    {8, 2048, 128, 128},   {8, 4096, 128, 128},
+      {8, 8192, 128, 128},   {8, 32768, 128, 128},
   };
 
   cudaDeviceProp prop;
@@ -304,7 +406,8 @@ int main(int argc, char** argv) {
 
   std::fprintf(f, "{\n");
   std::fprintf(f, "  \"benchmark\": \"kv-cache decode attention: fp16 fused "
-                  "vs w4 fused vs two-pass, same session\",\n");
+                  "vs w4 fused vs two-pass vs split-S flash (both cache "
+                  "types), same session\",\n");
   std::fprintf(f, "  \"timestamp_utc\": \"%s\",\n", timestamp_utc().c_str());
   std::fprintf(f, "  \"seed\": \"%" PRIu64 "\",\n", seed);
   std::fprintf(f, "  \"reps\": %d,\n", reps);
@@ -333,50 +436,93 @@ int main(int argc, char** argv) {
     const Case& c = cases[i];
     const Result r = run_case(c, reps, seed + (uint64_t)i * 7919);
 
+    const bool old_ok = c.S <= w4::gpu::KV_MAX_S;
     const double cache_elems = 2.0 * c.H * c.S * c.D;  // K and V
     const double fp16_bytes = cache_elems * 2.0;
     const double w4_bytes = cache_elems * 0.5 +
                             2.0 * c.H * c.S * ((c.D + c.gs - 1) / c.gs) * 2.0;
+    const double f8_bytes = cache_elems * 1.0 +
+                            2.0 * c.H * c.S * ((c.D + c.gs - 1) / c.gs) * 2.0;
     const double twopass_bytes = w4_bytes + 2.0 * cache_elems * 2.0;
-    const double fp16_med = median(r.fp16_ms);
-    const double w4_med = median(r.w4_ms);
-    const double tp_med = median(r.twopass_ms);
-
-    std::printf(
-        "H=%d S=%d D=%d: fp16 %.3f ms (%.1f GB/s), w4 %.3f ms (%.2fx vs "
-        "fp16, %.1f GB/s), two-pass %.3f ms (%.2fx)%s\n",
-        c.H, c.S, c.D, fp16_med, fp16_bytes / fp16_med * 1e-6, w4_med,
-        fp16_med / w4_med, w4_bytes / w4_med * 1e-6, tp_med,
-        tp_med / w4_med, r.hooks_bitwise ? "" : "  [HOOKS BITWISE FAILED]");
+    const double f16_med = median(r.flash16_ms);
+    const double fw4_med = median(r.flashw4_ms);
+    const double ff8_med = median(r.flashf8_ms);
+    if (old_ok) {
+      const double fp16_med = median(r.fp16_ms);
+      const double w4_med = median(r.w4_ms);
+      const double tp_med = median(r.twopass_ms);
+      std::printf(
+          "H=%d S=%d D=%d: fp16 %.3f (%.1f GB/s), w4 %.3f (%.2fx vs fp16), "
+          "two-pass %.3f (%.2fx), flash16 %.3f, flashw4 %.3f (%.2fx vs "
+          "flash16, %.1f GB/s), flashf8 %.3f (%.2fx vs flash16), "
+          "quant w4 %.2e f8 %.2e%s\n",
+          c.H, c.S, c.D, fp16_med, fp16_bytes / fp16_med * 1e-6, w4_med,
+          fp16_med / w4_med, tp_med, tp_med / w4_med, f16_med, fw4_med,
+          f16_med / fw4_med, w4_bytes / fw4_med * 1e-6, ff8_med,
+          f16_med / ff8_med, r.quant_rel_w4, r.quant_rel_f8,
+          r.hooks_bitwise ? "" : "  [HOOKS BITWISE FAILED]");
+    } else {
+      std::printf(
+          "H=%d S=%d D=%d: flash16 %.3f (%.1f GB/s), flashw4 %.3f (%.2fx vs "
+          "flash16, %.1f GB/s), flashf8 %.3f (%.2fx vs flash16), "
+          "quant w4 %.2e f8 %.2e%s  [single-block paths skip S>4096]\n",
+          c.H, c.S, c.D, f16_med, fp16_bytes / f16_med * 1e-6, fw4_med,
+          f16_med / fw4_med, w4_bytes / fw4_med * 1e-6, ff8_med,
+          f16_med / ff8_med, r.quant_rel_w4, r.quant_rel_f8,
+          r.hooks_bitwise ? "" : "  [HOOKS BITWISE FAILED]");
+    }
 
     std::fprintf(f, "    {\"H\": %d, \"S\": %d, \"D\": %d, \"gs\": %d,\n",
                  c.H, c.S, c.D, c.gs);
+    std::fprintf(f, "     \"old_paths_run\": %s,\n",
+                 old_ok ? "true" : "false");
     std::fprintf(f, "     \"hooks_bitwise\": %s,\n",
                  r.hooks_bitwise ? "true" : "false");
     std::fprintf(f, "     \"vs_reference_rel_l2\": %.3e,\n",
                  r.vs_reference_rel);
-    std::fprintf(f, "     \"fp16_wall_ms\": ");
-    print_ms_array(f, r.fp16_ms);
-    std::fprintf(f, ",\n     \"w4_wall_ms\": ");
-    print_ms_array(f, r.w4_ms);
-    std::fprintf(f, ",\n     \"twopass_wall_ms\": ");
-    print_ms_array(f, r.twopass_ms);
+    if (old_ok) {
+      std::fprintf(f, "     \"fp16_wall_ms\": ");
+      print_ms_array(f, r.fp16_ms);
+      std::fprintf(f, ",\n     \"w4_wall_ms\": ");
+      print_ms_array(f, r.w4_ms);
+      std::fprintf(f, ",\n     \"twopass_wall_ms\": ");
+      print_ms_array(f, r.twopass_ms);
+      std::fprintf(f,
+                   ",\n     \"fp16_median_ms\": %.4f, \"w4_median_ms\": %.4f, "
+                   "\"twopass_median_ms\": %.4f,\n",
+                   median(r.fp16_ms), median(r.w4_ms), median(r.twopass_ms));
+      std::fprintf(f,
+                   "     \"ratio_w4_vs_fp16\": %.3f, \"ratio_w4_vs_twopass\": "
+                   "%.3f,\n",
+                   median(r.fp16_ms) / median(r.w4_ms),
+                   median(r.twopass_ms) / median(r.w4_ms));
+    }
+    std::fprintf(f, "     \"flash16_wall_ms\": ");
+    print_ms_array(f, r.flash16_ms);
+    std::fprintf(f, ",\n     \"flashw4_wall_ms\": ");
+    print_ms_array(f, r.flashw4_ms);
+    std::fprintf(f, ",\n     \"flashf8_wall_ms\": ");
+    print_ms_array(f, r.flashf8_ms);
     std::fprintf(f,
-                 ",\n     \"fp16_median_ms\": %.4f, \"w4_median_ms\": %.4f, "
-                 "\"twopass_median_ms\": %.4f,\n",
-                 fp16_med, w4_med, tp_med);
+                 ",\n     \"flash16_median_ms\": %.4f, \"flashw4_median_ms\": "
+                 "%.4f, \"flashf8_median_ms\": %.4f,\n",
+                 f16_med, fw4_med, ff8_med);
     std::fprintf(f,
-                 "     \"ratio_w4_vs_fp16\": %.3f, \"ratio_w4_vs_twopass\": "
-                 "%.3f,\n",
-                 fp16_med / w4_med, tp_med / w4_med);
+                 "     \"ratio_flashw4_vs_flash16\": %.3f, "
+                 "\"ratio_flashf8_vs_flash16\": %.3f,\n",
+                 f16_med / fw4_med, f16_med / ff8_med);
+    std::fprintf(f,
+                 "     \"quant_rel_l2_w4\": %.4e, \"quant_rel_l2_f8\": %.4e,\n",
+                 r.quant_rel_w4, r.quant_rel_f8);
     std::fprintf(f,
                  "     \"fp16_bytes_min\": %.0f, \"w4_bytes_min\": %.0f, "
-                 "\"twopass_bytes_min\": %.0f,\n",
-                 fp16_bytes, w4_bytes, twopass_bytes);
+                 "\"f8_bytes_min\": %.0f, \"twopass_bytes_min\": %.0f,\n",
+                 fp16_bytes, w4_bytes, f8_bytes, twopass_bytes);
     std::fprintf(f,
-                 "     \"fp16_gbs_eff\": %.1f, \"w4_gbs_eff\": %.1f}%s\n",
-                 fp16_bytes / fp16_med * 1e-6, w4_bytes / w4_med * 1e-6,
-                 i + 1 < cases.size() ? "," : "");
+                 "     \"flash16_gbs_eff\": %.1f, \"flashw4_gbs_eff\": %.1f, "
+                 "\"flashf8_gbs_eff\": %.1f}%s\n",
+                 fp16_bytes / f16_med * 1e-6, w4_bytes / fw4_med * 1e-6,
+                 f8_bytes / ff8_med * 1e-6, i + 1 < cases.size() ? "," : "");
   }
 
   std::fprintf(f, "  ]\n}\n");

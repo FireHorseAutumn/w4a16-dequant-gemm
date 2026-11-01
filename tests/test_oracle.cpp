@@ -6,9 +6,11 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 #include "w4/kvcache.hpp"
+#include "w4/kvfp8.hpp"
 #include "w4/mx.hpp"
 #include "w4/pack.hpp"
 
@@ -422,6 +424,183 @@ int main() {
                  [&] { w4::kv::attention_reference(std::vector<__half>(3), c); }),
              "kv q size");
       (void)q;
+    }
+  }
+
+  // ---- FP8 (E4M3) KV cache host gates (R6) ----
+  // Per-element bounds against the exact rounding interval (bracketing
+  // scan over the 256-entry decode), the no-saturation invariant, a hand
+  // pin, sign, degenerate input, and the throw contracts.
+  {
+    // Exact E4M3 value table (NaN encodings excluded; never emitted).
+    double f8tab[256];
+    for (int b = 0; b < 256; ++b) {
+      const int e = (b >> 3) & 0xF, m = b & 7;
+      double mag = (e == 0) ? std::ldexp((double)m, -9)
+                            : std::ldexp((double)(8 + m), e - 10);
+      f8tab[b] = (b & 0x80) ? -mag : mag;
+    }
+    const std::vector<std::pair<int, int>> fcfgs = {
+        {64, 64}, {7, 96}, {16, 100}, {5, 40}, {3, 72},
+    };
+    for (size_t i = 0; i < fcfgs.size(); ++i) {
+      const int S = fcfgs[i].first, D = fcfgs[i].second;
+      const uint64_t seed = 0x8F1DULL ^ (uint64_t)(i * 977);
+      const auto k = w4::normal_weights(S * D, seed);
+      const auto v = w4::normal_weights(S * D, seed + 1);
+      const w4::kv8::KVCacheF8 c =
+          w4::kv8::quantize_cache_f8(k, v, 1, S, D, 32);
+      const auto wd = w4::kv8::dequant_head_f8(c, 0, false);
+      double worst = 0.0;
+      for (int t = 0; t < S; ++t)
+        for (int d = 0; d < D; ++d) {
+          const double sf = __half2float(c.s_k[(size_t)t * c.G + d / 32]);
+          const double wq = k[(size_t)t * D + d];
+          const uint8_t bc = c.q_k[(size_t)t * D + d];
+          const double dec = w4::kv8::decode_f8_e4m3(bc);
+          // Rounding interval of the chosen code: half the wider gap to
+          // its same-sign neighbors, plus the final FP16 rounding of
+          // sf * dec (half a ulp, 2^-11 relative) on top.
+          const double mag = std::fabs(dec);
+          double prev_m = 0.0, next_m = -1.0;
+          for (int b = 0; b <= 0x7E; ++b) {  // non-negative, non-NaN
+            if (f8tab[b] < mag) prev_m = f8tab[b];
+            if (f8tab[b] > mag && (next_m < 0.0 || f8tab[b] < next_m))
+              next_m = f8tab[b];
+          }
+          if (next_m < 0.0) next_m = mag + (mag - prev_m);  // top endstop
+          const double tol =
+              (0.5 * std::max(mag - prev_m, next_m - mag) +
+               mag * 4.9e-4) *
+                  sf +
+              1e-12;
+          const double err =
+              std::fabs((double)__half2float(wd[(size_t)t * D + d]) - wq);
+          worst = std::max(worst, err / tol);
+          ++checks;
+          if (err > tol) {
+            ++fails;
+            std::printf("FAIL f8 S=%d D=%d t=%d d=%d: |wd-w|=%.3e > %.3e\n",
+                        S, D, t, d, err, tol);
+          }
+          (void)dec;
+        }
+      // No-saturation invariant: no group's amax exceeds 448 * scale.
+      // The margin covers the FP16 rounding of the scale itself (the
+      // no-saturation rule is set in double; sf is its FP16 rounding).
+      for (int t = 0; t < S; ++t)
+        for (int g = 0; g < c.G; ++g) {
+          const int d0 = g * 32, d1 = std::min(D, d0 + 32);
+          double amax = 0.0;
+          for (int d = d0; d < d1; ++d)
+            amax = std::max(amax, std::fabs(k[(size_t)t * D + d]));
+          const double sf =
+              __half2float(c.s_k[(size_t)t * c.G + g]);
+          ++checks;
+          if (amax > 448.0 * sf * (1.0 + 1e-3)) {
+            ++fails;
+            std::printf("FAIL f8 saturation S=%d D=%d t=%d g=%d\n", S, D, t,
+                        g);
+          }
+        }
+      std::printf("f8 S=%d D=%d: worst err/tol = %.3f\n", S, D, worst);
+    }
+
+    // Hand pin: all 1.0 -> amax 1, s = 1/448, codes = 448 (0x7E),
+    // dequant exact 1.0.
+    {
+      const std::vector<double> w(8 * 8, 1.0);
+      const auto c = w4::kv8::quantize_cache_f8(w, w, 1, 8, 8, 8);
+      const auto wd = w4::kv8::dequant_head_f8(c, 0, false);
+      ++checks;
+      if (__half2float(wd[0]) != 1.0f || c.q_k[0] != 0x7E) {
+        ++fails;
+        std::printf("FAIL f8 pin: got %g code %#04x\n",
+                    (double)__half2float(wd[0]), (int)c.q_k[0]);
+      }
+    }
+
+    // Sign: all-negative block decodes negative.
+    {
+      const std::vector<double> w(8 * 8, -2.0);
+      const auto c = w4::kv8::quantize_cache_f8(w, w, 1, 8, 8, 8);
+      const auto wd = w4::kv8::dequant_head_f8(c, 0, true);
+      ++checks;
+      if (__half2float(wd[0]) != -2.0f || (c.q_v[0] & 0x80) == 0) {
+        ++fails;
+        std::printf("FAIL f8 sign: got %g code %#04x\n",
+                    (double)__half2float(wd[0]), (int)c.q_v[0]);
+      }
+    }
+
+    // Degenerate all-zero input: scale 1.0, all-zero codes, exact zeros.
+    {
+      const std::vector<double> w(4 * 16, 0.0);
+      const auto c = w4::kv8::quantize_cache_f8(w, w, 1, 4, 16, 8);
+      const auto wd = w4::kv8::dequant_head_f8(c, 0, false);
+      bool bad = false;
+      for (const auto& x : wd)
+        if (__half2float(x) != 0.0f) bad = true;
+      ++checks;
+      if (bad) {
+        ++fails;
+        std::printf("FAIL f8 zero input: nonzero dequant\n");
+      }
+    }
+
+    // Throw contracts: dims, gs, size, NaN, FP16 scale range, h bounds.
+    {
+      auto throws_invalid = [](auto&& f) {
+        try {
+          f();
+        } catch (const std::invalid_argument&) {
+          return true;
+        } catch (...) {
+        }
+        return false;
+      };
+      auto expect = [&](bool ok, const char* name) {
+        ++checks;
+        if (!ok) {
+          ++fails;
+          std::printf("FAIL f8 no-throw: %s\n", name);
+        }
+      };
+      const std::vector<double> ok(1 * 4 * 8, 0.5);
+      expect(throws_invalid(
+                 [&] { w4::kv8::quantize_cache_f8(ok, ok, 0, 4, 8, 8); }),
+             "f8 H=0");
+      expect(throws_invalid(
+                 [&] { w4::kv8::quantize_cache_f8(ok, ok, 1, 4, 8, 0); }),
+             "f8 gs=0");
+      expect(throws_invalid(
+                 [&] { w4::kv8::quantize_cache_f8(ok, ok, 1, 4, 8, 7); }),
+             "f8 gs=7");
+      expect(throws_invalid([&] {
+               w4::kv8::quantize_cache_f8(std::vector<double>(10), ok, 1, 4,
+                                          8, 8);
+             }),
+             "f8 size mismatch");
+      auto bad = ok;
+      bad[3] = std::nan("");
+      expect(throws_invalid(
+                 [&] { w4::kv8::quantize_cache_f8(bad, ok, 1, 4, 8, 8); }),
+             "f8 NaN");
+      bad[3] = 1e300;  // group scale overflows FP16
+      expect(throws_invalid(
+                 [&] { w4::kv8::quantize_cache_f8(bad, ok, 1, 4, 8, 8); }),
+             "f8 scale overflow");
+      std::vector<double> tiny(1 * 4 * 8, 1e-8);  // scale underflows FP16
+      expect(throws_invalid(
+                 [&] { w4::kv8::quantize_cache_f8(tiny, ok, 1, 4, 8, 8); }),
+             "f8 scale underflow");
+      auto c = w4::kv8::quantize_cache_f8(ok, ok, 1, 4, 8, 8);
+      expect(throws_invalid([&] { w4::kv8::dequant_head_f8(c, 1, false); }),
+             "f8 h out of range");
+      expect(throws_invalid([&] {
+               w4::kv8::attention_reference_f8(std::vector<__half>(3), c);
+             }),
+             "f8 q size");
     }
   }
 
