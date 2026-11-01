@@ -13,12 +13,18 @@
 //      oracle, so they are within 2e-3 of each other).
 //      Configs with M > 16 exercise the gridDim.y m-tiling and its guards.
 
+//   5. mma_kernel (WMMA/tensor-core path): same gates as the fused kernel —
+//      bitwise dequant through w_out, oracle at 1e-3, cuBLAS cross-check at
+//      2e-3. Ragged-K and partial-tile configs exercise the shared-memory
+//      zero padding.
+
 #include <cstdio>
 #include <cstring>
 #include <vector>
 
 #include "w4/dequant.cuh"
 #include "w4/fused.cuh"
+#include "w4/mma.cuh"
 
 struct Cfg {
   int M, N, K, gs;
@@ -179,6 +185,51 @@ int main() {
             sym ? "sym" : "asym", c.M, c.N, c.K, c.gs, rel_x);
       }
 
+      // MMA kernel: same gates as the fused path (bitwise dequant through
+      // w_out, oracle at 1e-3, cuBLAS cross-check at 2e-3).
+      w4::gpu::gemm_mma(dp, x_d, c_f, c.M, 0, w_d);
+      w4::gpu::cuda_check(cudaDeviceSynchronize(), "mma w_out sync");
+      w4::gpu::cuda_check(cudaMemcpy(w_gpu.data(), w_d,
+                                     (size_t)c.N * c.K * sizeof(__half),
+                                     cudaMemcpyDeviceToHost),
+                          "down w mma");
+      ++checks;
+      if (std::memcmp(w_gpu.data(), w_ref.data(),
+                      (size_t)c.N * c.K * sizeof(__half)) != 0) {
+        ++fails;
+        std::printf("FAIL mma dequant bitwise %s M=%d N=%d K=%d gs=%d\n",
+                    sym ? "sym" : "asym", c.M, c.N, c.K, c.gs);
+      }
+      w4::gpu::gemm_mma(dp, x_d, c_f, c.M);
+      w4::gpu::cuda_check(cudaDeviceSynchronize(), "mma sync");
+      w4::gpu::cuda_check(cudaMemcpy(c_fused.data(), c_f,
+                                     (size_t)c.M * c.N * sizeof(__half),
+                                     cudaMemcpyDeviceToHost),
+                          "down c mma");
+      double num_m = 0.0, num_mx = 0.0;
+      for (size_t j = 0; j < c_ref.size(); ++j) {
+        const double d = (double)__half2float(c_fused[j]) - c_ref[j];
+        num_m += d * d;
+        const double dx =
+            (double)__half2float(c_fused[j]) - (double)__half2float(c_gpu[j]);
+        num_mx += dx * dx;
+      }
+      const double rel_m = std::sqrt(num_m / (den > 0.0 ? den : 1.0));
+      const double rel_mx = std::sqrt(num_mx / (den > 0.0 ? den : 1.0));
+      worst_rel = std::max(worst_rel, rel_m);
+      ++checks;
+      if (rel_m > 1e-3) {
+        ++fails;
+        std::printf("FAIL mma gemm %s M=%d N=%d K=%d gs=%d rel=%.3e\n",
+                    sym ? "sym" : "asym", c.M, c.N, c.K, c.gs, rel_m);
+      }
+      ++checks;
+      if (rel_mx > 2e-3) {
+        ++fails;
+        std::printf("FAIL mma-vs-cublas %s M=%d N=%d K=%d gs=%d rel=%.3e\n",
+                    sym ? "sym" : "asym", c.M, c.N, c.K, c.gs, rel_mx);
+      }
+
       cudaFree(c_f);
 
       cudaFree(q_d);
@@ -275,6 +326,26 @@ int main() {
     // testable here — a passing M would launch against the dummy pointers.
     expect(throws_invalid([&] { w4::gpu::gemm_fused(good, out, out, 262141); }),
            "fused M past grid.y bound");
+    // MMA entry contracts: same structural rules (padding covers shapes).
+    expect(throws_invalid([&] { w4::gpu::gemm_mma(bad_gs0, out, out, 2); }),
+           "mma gs=0");
+    expect(throws_invalid([&] { w4::gpu::gemm_mma(bad_gs7, out, out, 2); }),
+           "mma gs=7");
+    expect(throws_invalid([&] { w4::gpu::gemm_mma(bad_g, out, out, 2); }),
+           "mma G wrong");
+    expect(throws_invalid([&] { w4::gpu::gemm_mma(bad_q, out, out, 2); }),
+           "mma q null");
+    expect(throws_invalid([&] { w4::gpu::gemm_mma(bad_z, out, out, 2); }),
+           "mma asym zeros null");
+    expect(throws_invalid([&] { w4::gpu::gemm_mma(sym_z, out, out, 2); }),
+           "mma sym carries zeros");
+    expect(throws_invalid([&] { w4::gpu::gemm_mma(good, out, out, 0); }),
+           "mma M=0");
+    expect(throws_invalid([&] { w4::gpu::gemm_mma(good, nullptr, out, 2); }),
+           "mma x null");
+    expect(throws_invalid([&] { w4::gpu::gemm_mma(good, out, nullptr, 2); }),
+           "mma c null");
+>>>>>>> aec7135 (W4A16 R3: fused dequant + WMMA — the M=64 loss is gone (0.43x -> 1.68x))
   }
 
   std::printf("gpu: %d checks, %d failures, worst gemm rel L2 = %.3e\n",

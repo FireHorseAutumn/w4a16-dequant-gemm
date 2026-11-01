@@ -1,8 +1,9 @@
 # W4A16 Fused Dequant GEMM
 
-**STATUS: R2 complete — fused SIMT kernel landed and gated. Wins 7.3–8.3x
-at M=1 down to 1.4–1.6x at M=16 vs the two-pass baseline; loses at M=64
-(0.4x, SIMT FP32 wall — tensor cores are R3). Governor-pinned numbers.**
+**STATUS: R3 complete — WMMA/tensor-core fused kernel landed and gated;
+it removes the SIMT M=64 loss (0.43x -> 1.68x vs baseline) and is flat
+1.4-2.0x across M (staging-latency bound; double-buffering is the next
+lever). SIMT fused stays the winner at M <= 16. Pinned rerun owed.**
 
 ## The kernel
 
@@ -57,6 +58,47 @@ Symmetric dequant: `w = scale * (q - 8)`; asymmetric: `w = scale * (q - z)`.
   plus end-to-end wall, raw reps + device/driver/clock/seed metadata in
   `data/w4a16_baseline_bench.json`. Bandwidth figures are analytic bytes
   moved / time, labeled; the GEMM byte count is the analytic minimum.
+
+## R3 contents (2026-10-31, same day — separate commit)
+
+- `include/w4/mma.cuh` — fused dequant + WMMA GEMM (`gemm_mma`). Block
+  tile 64x64, K in chunks of 32: the 256 threads dequant one packed word
+  each into a shared FP16 tile (`dequant_one`, unchanged) and stage the x
+  tile, both zero-padded past the N/M/K edges so ragged K and partial
+  tiles need no special path; 8 warps each own two 16x16x16 WMMA fragment
+  MMAs per k-fragment with FP32 accumulators; outputs store through a
+  per-warp shared tile with guarded copies. W is read exactly once at
+  M <= 64, the FMA floor drops to the tensor-core rate, and fragment loads
+  take x reuse from shared — all three SIMT M=64 walls removed at once.
+  The `w_out` hook keeps the bitwise dequant gate.
+- Gates: the MMA path gets the full fused gate set (bitwise dequant,
+  oracle 1e-3, cuBLAS cross-check 2e-3, entry throws). CTest 2/2, zero
+  warnings. CUDA 13 note: `store_matrix_sync` has no
+  float-accumulator-to-half-pointer overload, so fragments store to an
+  FP32 shared tile and the guarded copy does the `__float2half_rn`.
+
+## R3 numbers (2026-10-31, RTX 5060 Laptop, UNPINNED powersave governor)
+
+Same session, same bench as R2 (`bench_fused` now three-way); triad
+264.9 GB/s. Ratios vs the re-measured two-pass baseline:
+
+| M | N=4096 | N=14336 |
+|---|---|---|
+| 1 | 1.45x | 1.95x |
+| 8 | 1.38x | 2.00x |
+| 16 | 1.38x | 1.78x |
+| 64 | 1.42x | 1.68x |
+
+Flat across M and far under triad (25-43 GB/s effective) — the signature
+of a staging-latency-bound kernel: the chunk loop is single-buffered, two
+`__syncthreads` per chunk, no overlap. The M=64 SIMT loss is gone
+(0.43x -> 1.68x), which was the R3 charter; the margin headroom is
+double-buffering (cp.async / register prefetch), recorded as the next
+lever. Tile-shape A/Bs were run and rejected (chunk 64 doubles the
+x-staging footprint; N-tile 32 halves W work per chunk while x staging
+stays fixed). Best-of-dispatch vs baseline: SIMT M=1 7.5/7.7x, M=8
+2.2/2.9x, M=16 1.4/1.6x; MMA M=64 1.4/1.7x. The pinned MEAS-2 rerun is
+the authority on all of this.
 
 ## R2 contents (2026-10-31)
 

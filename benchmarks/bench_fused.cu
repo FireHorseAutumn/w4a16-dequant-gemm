@@ -1,15 +1,14 @@
-// Fused-kernel benchmark: the fused dequant+GEMM against the two-pass
-// baseline, same session, same shapes as bench_baseline. The baseline is
-// re-measured here (not copied from the R1 JSON) so the comparison is
-// immune to machine state across sessions; the FP64 triad is the
-// same-session bandwidth reference for both. Raw per-rep timings are
-// preserved; medians and bandwidth figures are derived from them. The fused
-// byte count is the analytic minimum (packed W x m-tiles + scales + X in,
-// C out) and does not account for L2 reuse of X.
+// Three-way benchmark: two-pass baseline vs SIMT fused dequant+GEMM vs
+// WMMA fused dequant+GEMM, same session, same shapes as bench_baseline. The
+// baseline is re-measured here (not copied from the R1 JSON) so the
+// comparison is immune to machine state across sessions; the FP64 triad is
+// the same-session bandwidth reference for all three. Raw per-rep timings
+// are preserved; medians and bandwidth figures are derived from them. The
+// fused/mma byte counts are analytic minima, not measured DRAM traffic.
 //
-// Bench-size correctness: the fused dequant path is bitwise-gated per case
-// (w_out hook vs the host reference); the FP64 oracle is gated at the test
-// sizes in test_gpu, so no precision claim is made at bench scale.
+// Bench-size correctness: both fused dequant paths are bitwise-gated per
+// case (w_out hook vs the host reference); the FP64 oracle is gated at the
+// test sizes in test_gpu, so no precision claim is made at bench scale.
 
 #include <algorithm>
 #include <chrono>
@@ -22,6 +21,7 @@
 
 #include "w4/dequant.cuh"
 #include "w4/fused.cuh"
+#include "w4/mma.cuh"
 
 namespace {
 
@@ -106,9 +106,9 @@ struct Case {
 
 struct Result {
   Case c;
-  std::vector<double> dequant_ms, gemm_ms, base_e2e_ms, fused_ms;
-  bool fused_dequant_bitwise;
-  double fused_vs_cublas_rel;
+  std::vector<double> dequant_ms, gemm_ms, base_e2e_ms, fused_ms, mma_ms;
+  bool fused_dequant_bitwise, mma_dequant_bitwise;
+  double fused_vs_cublas_rel, mma_vs_cublas_rel;
 };
 
 Result run_case(const Case& c, int reps, uint64_t seed) {
@@ -165,8 +165,18 @@ Result run_case(const Case& c, int reps, uint64_t seed) {
       std::memcmp(w_gpu.data(), w_ref.data(),
                   (size_t)c.N * c.K * sizeof(__half)) == 0;
 
-  // One fused-vs-cuBLAS agreement figure per case (informational; the gate
-  // lives in test_gpu).
+  // Same for the MMA path.
+  gemm_mma(dp, x_d, cf_d, c.M, 0, w_d);
+  cuda_check(cudaDeviceSynchronize(), "mma w_out sync");
+  cuda_check(cudaMemcpy(w_gpu.data(), w_d, (size_t)c.N * c.K * sizeof(__half),
+                        cudaMemcpyDeviceToHost),
+             "down w mma");
+  const bool bitwise_mma =
+      std::memcmp(w_gpu.data(), w_ref.data(),
+                  (size_t)c.N * c.K * sizeof(__half)) == 0;
+
+  // One fused/mma-vs-cuBLAS agreement figure per case (informational; the
+  // gate lives in test_gpu).
   dequant(dp, w_d);
   gemm_fp16(cb, w_d, x_d, c_d, c.M, c.N, c.K);
   gemm_fused(dp, x_d, cf_d, c.M);
@@ -187,6 +197,20 @@ Result run_case(const Case& c, int reps, uint64_t seed) {
     const double b = (double)__half2float(c_base[j]);
     den += b * b;
   }
+  const double fused_rel = std::sqrt(num / (den > 0.0 ? den : 1.0));
+  gemm_mma(dp, x_d, cf_d, c.M);
+  cuda_check(cudaDeviceSynchronize(), "mma agree sync");
+  cuda_check(cudaMemcpy(c_fused.data(), cf_d,
+                        (size_t)c.M * c.N * sizeof(__half),
+                        cudaMemcpyDeviceToHost),
+             "down c mma");
+  num = 0.0;
+  for (size_t j = 0; j < c_base.size(); ++j) {
+    const double d =
+        (double)__half2float(c_fused[j]) - (double)__half2float(c_base[j]);
+    num += d * d;
+  }
+  const double mma_rel = std::sqrt(num / (den > 0.0 ? den : 1.0));
 
   cudaEvent_t e0, e1, e2;
   cudaEventCreate(&e0);
@@ -196,7 +220,9 @@ Result run_case(const Case& c, int reps, uint64_t seed) {
   Result r;
   r.c = c;
   r.fused_dequant_bitwise = bitwise;
-  r.fused_vs_cublas_rel = std::sqrt(num / (den > 0.0 ? den : 1.0));
+  r.mma_dequant_bitwise = bitwise_mma;
+  r.fused_vs_cublas_rel = fused_rel;
+  r.mma_vs_cublas_rel = mma_rel;
 
   for (int rep = -2; rep < reps; ++rep) {  // two warmup reps, unrecorded
     const auto t0 = std::chrono::steady_clock::now();
@@ -211,6 +237,9 @@ Result run_case(const Case& c, int reps, uint64_t seed) {
     gemm_fused(dp, x_d, cf_d, c.M);
     cuda_check(cudaDeviceSynchronize(), "fused sync");
     const auto t3 = std::chrono::steady_clock::now();
+    gemm_mma(dp, x_d, cf_d, c.M);
+    cuda_check(cudaDeviceSynchronize(), "mma sync");
+    const auto t4 = std::chrono::steady_clock::now();
     if (rep < 0) continue;
     float dq = 0.0f, gm = 0.0f;
     cuda_check(cudaEventElapsedTime(&dq, e0, e1), "dequant time");
@@ -221,6 +250,8 @@ Result run_case(const Case& c, int reps, uint64_t seed) {
         std::chrono::duration<double, std::milli>(t1 - t0).count());
     r.fused_ms.push_back(
         std::chrono::duration<double, std::milli>(t3 - t2).count());
+    r.mma_ms.push_back(
+        std::chrono::duration<double, std::milli>(t4 - t3).count());
   }
 
   cudaEventDestroy(e0);
@@ -306,8 +337,8 @@ int main(int argc, char** argv) {
   }
 
   std::fprintf(f, "{\n");
-  std::fprintf(f, "  \"benchmark\": \"w4a16 fused dequant+GEMM vs two-pass "
-                  "baseline, same session\",\n");
+  std::fprintf(f, "  \"benchmark\": \"w4a16 two-pass vs fused SIMT vs fused "
+                  "WMMA, same session\",\n");
   std::fprintf(f, "  \"timestamp_utc\": \"%s\",\n", timestamp_utc().c_str());
   std::fprintf(f, "  \"seed\": \"%" PRIu64 "\",\n", seed);
   std::fprintf(f, "  \"reps\": %d,\n", reps);
@@ -343,28 +374,41 @@ int main(int argc, char** argv) {
         (double)c.N * ((c.K + c.gs - 1) / c.gs) * 2.0 +
         (c.sym ? 0.0
                : (double)c.N * ((c.K + c.gs - 1) / c.gs) * 0.5);
-    // packed W x m-tiles, plus the x FP32 pre-pass (read half, write
+    // fused: packed W x m-tiles, plus the x FP32 pre-pass (read half, write
     // float, re-read float per m-tile), C out.
     const double fused_bytes =
         packed_bytes * mtiles + (double)c.M * c.K * (2.0 + 4.0) +
         (double)c.M * c.K * 4.0 * mtiles + (double)c.M * c.N * 2.0;
+    // mma: packed W x ceil(M/64) m-tiles, X in, C out (x reuse is through
+    // shared/L2 by construction).
+    const int mma_mtiles = (c.M + 63) / 64;
+    const double mma_bytes = packed_bytes * mma_mtiles +
+                             (double)c.M * c.K * 2.0 +
+                             (double)c.M * c.N * 2.0;
     const double base_med = median(r.base_e2e_ms);
     const double fused_med = median(r.fused_ms);
+    const double mma_med = median(r.mma_ms);
 
     std::printf(
-        "M=%d K=%d N=%d gs=%d %s: baseline e2e %.3f ms, fused %.3f ms "
-        "(%.1f GB/s eff), ratio %.2fx%s\n",
+        "M=%d K=%d N=%d gs=%d %s: baseline %.3f ms, fused %.3f ms (%.2fx), "
+        "mma %.3f ms (%.2fx, %.1f GB/s eff)%s%s\n",
         c.M, c.K, c.N, c.gs, c.sym ? "sym" : "asym", base_med, fused_med,
-        fused_bytes / fused_med * 1e-6, base_med / fused_med,
-        r.fused_dequant_bitwise ? "" : "  [BITWISE GATE FAILED]");
+        base_med / fused_med, mma_med, base_med / mma_med,
+        mma_bytes / mma_med * 1e-6,
+        r.fused_dequant_bitwise ? "" : "  [FUSED BITWISE FAILED]",
+        r.mma_dequant_bitwise ? "" : "  [MMA BITWISE FAILED]");
 
     std::fprintf(f, "    {\"M\": %d, \"K\": %d, \"N\": %d, \"gs\": %d, "
                     "\"symmetric\": %s,\n", c.M, c.K, c.N, c.gs,
                  c.sym ? "true" : "false");
     std::fprintf(f, "     \"fused_dequant_bitwise\": %s,\n",
                  r.fused_dequant_bitwise ? "true" : "false");
+    std::fprintf(f, "     \"mma_dequant_bitwise\": %s,\n",
+                 r.mma_dequant_bitwise ? "true" : "false");
     std::fprintf(f, "     \"fused_vs_cublas_rel_l2\": %.3e,\n",
                  r.fused_vs_cublas_rel);
+    std::fprintf(f, "     \"mma_vs_cublas_rel_l2\": %.3e,\n",
+                 r.mma_vs_cublas_rel);
     std::fprintf(f, "     \"mtiles\": %d,\n", mtiles);
     std::fprintf(f, "     \"dequant_ms\": ");
     print_ms_array(f, r.dequant_ms);
@@ -374,12 +418,18 @@ int main(int argc, char** argv) {
     print_ms_array(f, r.base_e2e_ms);
     std::fprintf(f, ",\n     \"fused_wall_ms\": ");
     print_ms_array(f, r.fused_ms);
+    std::fprintf(f, ",\n     \"mma_wall_ms\": ");
+    print_ms_array(f, r.mma_ms);
     std::fprintf(f,
                  ",\n     \"baseline_e2e_median_ms\": %.4f, "
-                 "\"fused_median_ms\": %.4f, \"ratio\": %.3f,\n",
-                 base_med, fused_med, base_med / fused_med);
+                 "\"fused_median_ms\": %.4f, \"mma_median_ms\": %.4f,\n",
+                 base_med, fused_med, mma_med);
+    std::fprintf(f, "     \"ratio_fused\": %.3f, \"ratio_mma\": %.3f,\n",
+                 base_med / fused_med, base_med / mma_med);
     std::fprintf(f, "     \"fused_bytes_min\": %.0f, \"fused_gbs_eff\": "
-                    "%.1f}%s\n", fused_bytes, fused_bytes / fused_med * 1e-6,
+                    "%.1f,\n", fused_bytes, fused_bytes / fused_med * 1e-6);
+    std::fprintf(f, "     \"mma_bytes_min\": %.0f, \"mma_gbs_eff\": %.1f}%s\n",
+                 mma_bytes, mma_bytes / mma_med * 1e-6,
                  i + 1 < cases.size() ? "," : "");
   }
 
