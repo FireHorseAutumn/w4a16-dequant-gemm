@@ -169,14 +169,19 @@ inline void gemm_fused_mx(const DevicePackedWm& p, const __half* x, __half* c,
   validate_mx(p);
   if (!x || !c) throw std::invalid_argument("mx fused: null pointer");
   if (M < 1) throw std::invalid_argument("mx fused: bad M");
+  const int mtile = M <= 1 ? 1 : (M <= 2 ? 2 : 4);
+  const int rpw = M <= 4 ? 1 : 4;
+  // Same launch bounds as gemm_fused: gridDim.y caps at 65535 (the
+  // m-tiling bounds M); on gridDim.x only the ceil-rounding add can
+  // overflow, N being an int.
+  if (M > 65535 * mtile || p.N > INT32_MAX - 8 * rpw)
+    throw std::invalid_argument("mx fused: launch grid out of range");
 
   float* xf = x_scratch((size_t)M * p.K);
   x_to_f32_kernel<<<(unsigned)(((size_t)M * p.K + 255) / 256), 256, 0,
                     stream>>>(x, xf, (size_t)M * p.K);
   cuda_check(cudaGetLastError(), "x_to_f32_kernel");
 
-  const int mtile = M <= 1 ? 1 : (M <= 2 ? 2 : 4);
-  const int rpw = M <= 4 ? 1 : 4;
   const dim3 grid((unsigned)((p.N + 8 * rpw - 1) / (8 * rpw)),
                   (unsigned)((M + mtile - 1) / mtile));
   const int block = 256;
@@ -289,7 +294,11 @@ inline void gemm_mma_mx(const DevicePackedWm& p, const __half* x, __half* c,
   validate_mx(p);
   if (!x || !c) throw std::invalid_argument("mx mma: null pointer");
   if (M < 1) throw std::invalid_argument("mx mma: bad M");
-  // Edge tiles are zero-padded in shared memory, so any (M, N, K) is legal.
+  // Edge tiles are zero-padded in shared memory. Same launch bounds as
+  // gemm_mma: gridDim.y caps at 65535 (the 64-row m-tiling bounds M); on
+  // gridDim.x only the ceil-rounding add can overflow, N being an int.
+  if (M > 65535 * MMA_TILE_M || p.N > INT32_MAX - MMA_TILE_N)
+    throw std::invalid_argument("mx mma: launch grid out of range");
 
   const dim3 grid((unsigned)((p.N + MMA_TILE_N - 1) / MMA_TILE_N),
                   (unsigned)((M + MMA_TILE_M - 1) / MMA_TILE_M));

@@ -400,6 +400,11 @@ int main() {
       expect(throws_invalid(
                  [&] { w4::kv::quantize_cache(ok, ok, 1, 4, 8, 7, true); }),
              "kv gs=7");
+      // gs=0 divided into G before the per-head quantizer could validate it
+      // (SIGFPE at a host entry point, caught in the hardening pass).
+      expect(throws_invalid(
+                 [&] { w4::kv::quantize_cache(ok, ok, 1, 4, 8, 0, true); }),
+             "kv gs=0");
       expect(throws_invalid([&] {
                w4::kv::quantize_cache(std::vector<double>(10), ok, 1, 4, 8, 8,
                                       true);

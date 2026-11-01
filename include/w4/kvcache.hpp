@@ -62,6 +62,8 @@ inline KVCacheW4 quantize_cache(const std::vector<double>& k,
                                 int D, int gs, bool symmetric) {
   if (H < 1 || S < 1 || D < 1)
     throw std::invalid_argument("quantize_cache: bad dims");
+  if (gs < 8 || gs % 8 != 0)
+    throw std::invalid_argument("quantize_cache: gs must be a multiple of 8");
   if (k.size() != (size_t)H * S * D || v.size() != (size_t)H * S * D)
     throw std::invalid_argument("quantize_cache: size");
   KVCacheW4 c;

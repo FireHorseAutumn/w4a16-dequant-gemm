@@ -3,9 +3,9 @@
 **STATUS: R5 complete — KV-cache-quantized decode attention landed and
 gated (W4 cache, dequant at load in both K and V phases). Wins the
 two-pass everywhere (1.4–4.3x); vs an FP16-cache fused baseline it loses
-at small caches and wins once the FP16 cache spills L2 (1.15x at 64 MB) —
+at small caches and wins once the FP16 cache spills L2 (1.12x at 64 MB) —
 the output phase is instruction-bound before it is byte-bound. R4 (MXFP4)
-complete before it. Pinned rerun owed.**
+complete before it. Governor-pinned numbers.**
 
 ## The kernel
 
@@ -97,27 +97,27 @@ Symmetric dequant: `w = scale * (q - 8)`; asymmetric: `w = scale * (q - z)`.
   figure: rel L2 of dequant(quant(W)) vs the FP64 source, MXFP4 vs W4A16
   gs=128 symmetric, on identical data.
 
-## R4 numbers (2026-10-31, RTX 5060 Laptop, UNPINNED powersave governor)
+## R4 numbers (2026-11-01 pinned rerun, RTX 5060 Laptop, performance governor)
 
-Same-session triad 264.4 GB/s; MX two-pass baseline re-measured in
+Same-session triad 321.4 GB/s; MX two-pass baseline re-measured in
 session. SIMT-fused / MMA ratios vs baseline:
 
 | M | SIMT N=4096 | SIMT N=14336 | MMA N=4096 | MMA N=14336 |
 |---|---|---|---|---|
-| 1 | 5.61x | 6.55x | 1.37x | 1.87x |
-| 8 | 1.99x | 2.48x | 1.31x | 1.88x |
-| 16 | 1.14x | 1.33x | 1.32x | 1.78x |
-| 64 | 0.34x | 0.33x | 1.34x | 1.49x |
+| 1 | 5.55x | 6.34x | 1.34x | 1.79x |
+| 8 | 2.01x | 2.43x | 1.29x | 1.81x |
+| 16 | 1.14x | 1.33x | 1.28x | 1.80x |
+| 64 | 0.34x | 0.36x | 1.34x | 1.71x |
 
 The W4 dispatch picture reproduces on a different dequant arithmetic:
 SIMT wins decode shapes (M <= 16), MMA removes the M=64 loss. MX fused
-SIMT runs a few points under its W4 counterpart (5.61x vs 5.76x at M=1,
-N=4096) — the scale-byte fetch per four words plus the decode ALU.
-Quantization accuracy on Gaussian weights: MXFP4 rel L2 1.15e-1 vs W4A16
-gs=128 symmetric 1.17e-1 — parity on this distribution; MX's finer blocks
-(32 vs 128 elements) do not buy accuracy here because the E8M0 scale is a
-bare power of two where W4's is FP16. One distribution, one seed set; not
-a general format ranking. A pinned-governor rerun of all of this is owed.
+SIMT runs under its W4 counterpart (5.55x vs 7.33x at M=1, N=4096) — the
+scale-byte fetch per four words plus the decode ALU. Quantization
+accuracy on Gaussian weights: MXFP4 rel L2 1.15e-1 vs W4A16 gs=128
+symmetric 1.17e-1 — parity on this distribution; MX's finer blocks (32
+vs 128 elements) do not buy accuracy here because the E8M0 scale is a
+bare power of two where W4's is FP16. One distribution, one seed set;
+not a general format ranking.
 
 ## R3 contents (2026-10-31, same day — separate commit)
 
@@ -137,28 +137,29 @@ a general format ranking. A pinned-governor rerun of all of this is owed.
   float-accumulator-to-half-pointer overload, so fragments store to an
   FP32 shared tile and the guarded copy does the `__float2half_rn`.
 
-## R3 numbers (2026-10-31, RTX 5060 Laptop, UNPINNED powersave governor)
+## R3 numbers (2026-11-01 pinned rerun, RTX 5060 Laptop, performance governor)
 
-Same session, same bench as R2 (`bench_fused` now three-way); triad
-264.9 GB/s. Ratios vs the re-measured two-pass baseline:
+Same bench as R2 (`bench_fused` three-way), re-measured two-pass
+baseline; triad 320.6 GB/s. MMA ratios vs baseline:
 
 | M | N=4096 | N=14336 |
 |---|---|---|
-| 1 | 1.45x | 1.95x |
-| 8 | 1.38x | 2.00x |
-| 16 | 1.38x | 1.78x |
-| 64 | 1.42x | 1.68x |
+| 1 | 1.41x | 1.88x |
+| 8 | 1.35x | 1.92x |
+| 16 | 1.35x | 1.90x |
+| 64 | 1.40x | 1.79x |
 
-Flat across M and far under triad (25-43 GB/s effective) — the signature
+Flat across M and far under triad (35–45 GB/s effective) — the signature
 of a staging-latency-bound kernel: the chunk loop is single-buffered, two
 `__syncthreads` per chunk, no overlap. The M=64 SIMT loss is gone
-(0.43x -> 1.68x), which was the R3 charter; the margin headroom is
-double-buffering (cp.async / register prefetch), recorded as the next
-lever. Tile-shape A/Bs were run and rejected (chunk 64 doubles the
-x-staging footprint; N-tile 32 halves W work per chunk while x staging
-stays fixed). Best-of-dispatch vs baseline: SIMT M=1 7.5/7.7x, M=8
-2.2/2.9x, M=16 1.4/1.6x; MMA M=64 1.4/1.7x. A pinned-governor rerun is
-owed and is the authority on all of this.
+(0.44x -> 1.79x at N=14336), which was the R3 charter; the margin
+headroom is double-buffering (cp.async / register prefetch), recorded as
+the next lever. Tile-shape A/Bs were run and rejected (chunk 64 doubles
+the x-staging footprint; N-tile 32 halves W work per chunk while x
+staging stays fixed). The same run re-measured the SIMT fused path — the
+R2 table above is this session — reproducing the 2026-10-31 pinned
+numbers to a few hundredths. Best-of-dispatch vs baseline: SIMT M <= 16,
+MMA M=64.
 
 ## R5 contents (2026-10-31 — KV-cache decode attention)
 
@@ -185,22 +186,22 @@ owed and is the authority on all of this.
   output vs the FP64 reference at rel L2 <= 1e-3; vs the device two-pass
   (per-head dequant + FP16 attention) at 2e-3. Configs cover S=1, ragged
   words (D=96), both sign modes, and S=4096 exactly on the bound. CTest
-  2/2, 319 checks, zero warnings.
+  2/2, 350 checks, zero warnings.
 - `benchmarks/bench_attention.cu` — FP16 fused vs W4 fused vs two-pass,
   same session, MHA (H=32) and GQA (H=8) head counts; raw reps + metadata
   in `data/w4a16_kv_bench.json`.
 
-## R5 numbers (2026-10-31, RTX 5060 Laptop, UNPINNED powersave governor)
+## R5 numbers (2026-11-01 pinned rerun, RTX 5060 Laptop, performance governor)
 
-Same-session triad 264.5 GB/s. W4 fused vs the two denominators:
+Same-session triad 319.7 GB/s. W4 fused vs the two denominators:
 
 | H | S | vs two-pass | vs FP16 fused |
 |---|---|---|---|
-| 32 | 512 | 4.32x | 0.85x |
-| 32 | 2048 | 2.47x | 0.57x |
-| 32 | 4096 | 2.55x | 1.15x |
-| 8 | 512 | 1.83x | 0.90x |
-| 8 | 2048 | 1.45x | 0.90x |
+| 32 | 512 | 4.34x | 0.86x |
+| 32 | 2048 | 2.48x | 0.59x |
+| 32 | 4096 | 2.52x | 1.12x |
+| 8 | 512 | 1.84x | 0.90x |
+| 8 | 2048 | 1.44x | 0.90x |
 | 8 | 4096 | 1.41x | 0.89x |
 
 Read this honestly. The fusion win over the two-pass is real and
@@ -208,9 +209,9 @@ everywhere — the dequant round-trip to DRAM is eliminated as in the GEMM
 rungs. But against the FP16-cache fused baseline the quantized kernel
 only wins at the largest cache, and loses or washes below it. The output
 phase is instruction-bound (per-element dequant with 8-way redundant word
-touches — 32-44 GB/s effective, nowhere near triad), not byte-bound; the
+touches — 12–44 GB/s effective, nowhere near triad), not byte-bound; the
 4x byte savings only pay once the FP16 cache spills out of L2 (64 MB at
-H=32/S=4096, where the FP16 path degrades 220 -> 110 GB/s while the 16 MB
+H=32/S=4096, where the FP16 path degrades 220 -> 118 GB/s while the 16 MB
 packed cache stays resident). The win that exists is cache-residency
 extension — the quantization argument that actually holds for long-context
 decode. The named lever for the small-cache loss is a chunk-staged
@@ -239,27 +240,28 @@ element); recorded, not done.
   session (ratios immune to cross-session machine state), same shapes as
   the baseline bench, raw reps + metadata in `data/w4a16_fused_bench.json`.
 
-## R2 numbers (2026-10-31, RTX 5060 Laptop, governor-pinned)
+## R2 numbers (2026-11-01, RTX 5060 Laptop, governor-pinned)
 
-Same-session triad 320.1 GB/s; baseline re-measured in session. Raw reps +
+Same-session triad 320.6 GB/s; baseline re-measured in session. Raw reps +
 metadata in `data/w4a16_fused_bench.json`. The pre-committed bar was
 >= 1.5x e2e at decode shapes.
 
 | M | N=4096 | N=14336 |
 |---|---|---|
-| 1 | 7.25x | 8.31x |
-| 8 | 2.28x | 2.88x |
-| 16 | 1.36x | 1.64x |
-| 64 | 0.44x | 0.46x |
+| 1 | 7.33x | 8.25x |
+| 8 | 2.29x | 2.87x |
+| 16 | 1.37x | 1.64x |
+| 64 | 0.44x | 0.45x |
 
 M=1 and M=8 clear the bar; M=16 clears it at N=14336 and misses at
 N=4096; M=64 loses outright. The M=64 loss is structural for SIMT FP32:
 N*M*K FMAs on CUDA cores plus packed-W re-reads from m-tiling and x L2
 traffic (~2.4 TB/s measured effective — the kernel is L2-bound before it
 is FMA-bound). Both are exactly what WMMA fragment tiling removes, which
-is the R3 justification. An unpinned run earlier the same day showed the
-same ordering at lower magnitude (M=1 5.8–7.3x, M=64 0.36–0.45x); the
-pinned numbers above are the record.
+is the R3 justification. An unpinned run on 2026-10-31 showed the same
+ordering at lower magnitude (M=1 5.8–7.3x, M=64 0.36–0.45x), and a pinned
+run that same night matched the table above to a few hundredths
+(7.25/8.31x at M=1); the numbers here are the record.
 
 ## Pinned numbers (2026-10-30, RTX 5060 Laptop, governor-pinned idle machine)
 

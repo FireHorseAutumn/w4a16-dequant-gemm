@@ -50,6 +50,7 @@ int main() {
       {17, 64, 128, 16},   // M > 16: m-tiling and partial-tile guards
       {33, 48, 104, 24},   // m-tiles with gs % 32 != 0
       {20, 32, 100, 8},    // m-tiles with ragged K
+      {65, 96, 100, 16},   // M > 64: multi-m-tile MMA grid, ragged K
   };
   int checks = 0, fails = 0;
   double worst_rel = 0.0;
@@ -721,6 +722,17 @@ int main() {
            "mma x null");
     expect(throws_invalid([&] { w4::gpu::gemm_mma(good, out, nullptr, 2); }),
            "mma c null");
+    // gridDim.y caps at 65535: with the 64-row m-tile the MMA launcher must
+    // reject M > 4194240, and N near INT32_MAX must not overflow the
+    // ceil-rounding add. Throw side only, dummy pointers never launched.
+    expect(throws_invalid([&] { w4::gpu::gemm_mma(good, out, out, 4194241); }),
+           "mma M past grid.y bound");
+    {
+      auto huge_n = good;
+      huge_n.N = INT32_MAX;
+      expect(throws_invalid([&] { w4::gpu::gemm_mma(huge_n, out, out, 2); }),
+             "mma N overflow");
+    }
 
     // MX entry contracts: dims, B-vs-K consistency, null pointers, M, and
     // the 2^31 launch bound on the naive dequant.
@@ -758,6 +770,23 @@ int main() {
            "mx mma x null");
     expect(throws_invalid([&] { w4::gpu::gemm_mma_mx(good_mx, out, out, 0); }),
            "mx mma M=0");
+    // MX launch bounds: same gridDim.y / ceil-add limits as the W4 entries.
+    expect(throws_invalid(
+               [&] { w4::gpu::gemm_fused_mx(good_mx, out, out, 262141); }),
+           "mx fused M past grid.y bound");
+    expect(throws_invalid(
+               [&] { w4::gpu::gemm_mma_mx(good_mx, out, out, 4194241); }),
+           "mx mma M past grid.y bound");
+    {
+      auto huge_mx = good_mx;
+      huge_mx.N = INT32_MAX;
+      expect(throws_invalid(
+                 [&] { w4::gpu::gemm_fused_mx(huge_mx, out, out, 2); }),
+             "mx fused N overflow");
+      expect(throws_invalid(
+                 [&] { w4::gpu::gemm_mma_mx(huge_mx, out, out, 2); }),
+             "mx mma N overflow");
+    }
 
     // KV attention entry contracts: dims, the S/D shared-memory bounds, gs,
     // G consistency, null pointers, zeros discipline.
@@ -798,6 +827,9 @@ int main() {
     expect(throws_invalid(
                [&] { w4::gpu::attention_fp16(out, out, out, out, 1, 5000, 8); }),
            "kv fp16 S bound");
+    expect(throws_invalid(
+               [&] { w4::gpu::attention_fp16(out, out, out, out, 1, 4, 513); }),
+           "kv fp16 D bound");
     expect(throws_invalid(
                [&] { w4::gpu::attention_fp16(nullptr, out, out, out, 1, 4, 8); }),
            "kv fp16 q null");

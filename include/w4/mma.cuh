@@ -159,8 +159,12 @@ inline void gemm_mma(const DevicePackedW& p, const __half* x, __half* c,
   if (p.symmetric && p.zeros)
     throw std::invalid_argument("mma: symmetric carries no zeros");
   if (M < 1) throw std::invalid_argument("mma: bad M");
-  // Edge tiles are zero-padded in shared memory, so any (M, N, K) is legal;
-  // all fragment addressing is shared-internal 32-byte-aligned.
+  // Edge tiles are zero-padded in shared memory; all fragment addressing is
+  // shared-internal 32-byte-aligned. gridDim.y caps at 65535, so the
+  // 64-row m-tiling bounds M; gridDim.x is 2^31-1 and N is an int, so only
+  // the ceil-rounding add could overflow there.
+  if (M > 65535 * MMA_TILE_M || p.N > INT32_MAX - MMA_TILE_N)
+    throw std::invalid_argument("mma: launch grid out of range");
 
   const dim3 grid((unsigned)((p.N + MMA_TILE_N - 1) / MMA_TILE_N),
                   (unsigned)((M + MMA_TILE_M - 1) / MMA_TILE_M));
