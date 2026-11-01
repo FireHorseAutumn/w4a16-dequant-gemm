@@ -60,3 +60,10 @@ target_compile_options(bench_baseline PRIVATE -Wall -Wextra)
 target_compile_definitions(bench_baseline PRIVATE
   W4_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data"
   W4_BUILD_TYPE="${CMAKE_BUILD_TYPE}")
+
+add_executable(bench_fused benchmarks/bench_fused.cu)
+target_link_libraries(bench_fused PRIVATE w4 CUDA::cublas)
+target_compile_options(bench_fused PRIVATE -Wall -Wextra)
+target_compile_definitions(bench_fused PRIVATE
+  W4_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data"
+  W4_BUILD_TYPE="${CMAKE_BUILD_TYPE}")

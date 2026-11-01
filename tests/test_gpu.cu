@@ -1,4 +1,4 @@
-// GPU gates for the two-pass baseline:
+// GPU gates for the two-pass baseline and the fused kernel:
 //   1. dequant_kernel output is bitwise identical to the host reference
 //      (both sides call dequant_one; any drift here is a real bug).
 //   2. cuBLAS FP16/FP32-accum GEMM vs the FP64 oracle at rel L2 <= 1e-3.
@@ -6,12 +6,19 @@
 //      deviation is accumulation order and the final half rounding;
 //      measured worst case is printed. The gate exists to catch silent
 //      wrong output, not to grade rounding.
+//   3. fused_kernel with w_out set reproduces dequant_all bitwise (gate 1
+//      applied to the fused dequant path).
+//   4. fused_kernel GEMM vs the FP64 oracle at rel L2 <= 1e-3, and vs the
+//      cuBLAS output at rel L2 <= 2e-3 (each side is within 1e-3 of the
+//      oracle, so they are within 2e-3 of each other).
+//      Configs with M > 16 exercise the gridDim.y m-tiling and its guards.
 
 #include <cstdio>
 #include <cstring>
 #include <vector>
 
 #include "w4/dequant.cuh"
+#include "w4/fused.cuh"
 
 struct Cfg {
   int M, N, K, gs;
@@ -22,6 +29,9 @@ int main() {
       {1, 64, 64, 8},      {8, 128, 96, 16},  {16, 256, 100, 32},
       {4, 96, 72, 48},     {2, 32, 128, 64},  {3, 40, 256, 128},
       {5, 72, 40, 8},
+      {17, 64, 128, 16},   // M > 16: m-tiling and partial-tile guards
+      {33, 48, 104, 24},   // m-tiles with gs % 32 != 0
+      {20, 32, 100, 8},    // m-tiles with ragged K
   };
   int checks = 0, fails = 0;
   double worst_rel = 0.0;
@@ -54,6 +64,10 @@ int main() {
           cudaMalloc(&x_d, (size_t)c.M * c.K * sizeof(__half)), "malloc x");
       w4::gpu::cuda_check(
           cudaMalloc(&c_d, (size_t)c.M * c.N * sizeof(__half)), "malloc c");
+      __half* c_f = nullptr;
+      w4::gpu::cuda_check(
+          cudaMalloc(&c_f, (size_t)c.M * c.N * sizeof(__half)),
+          "malloc c fused");
 
       w4::gpu::cuda_check(cudaMemcpy(q_d, p.q.data(),
                                      p.q.size() * sizeof(uint32_t),
@@ -116,6 +130,57 @@ int main() {
                     sym ? "sym" : "asym", c.N, c.K, c.gs, rel);
       }
 
+      // Fused kernel, dequant path: w_out must reproduce dequant_all
+      // bitwise (w_d is free to reuse; the two-pass no longer needs it).
+      w4::gpu::gemm_fused(dp, x_d, c_f, c.M, 0, w_d);
+      w4::gpu::cuda_check(cudaDeviceSynchronize(), "fused w_out sync");
+      w4::gpu::cuda_check(cudaMemcpy(w_gpu.data(), w_d,
+                                     (size_t)c.N * c.K * sizeof(__half),
+                                     cudaMemcpyDeviceToHost),
+                          "down w fused");
+      ++checks;
+      if (std::memcmp(w_gpu.data(), w_ref.data(),
+                      (size_t)c.N * c.K * sizeof(__half)) != 0) {
+        ++fails;
+        std::printf("FAIL fused dequant bitwise %s M=%d N=%d K=%d gs=%d\n",
+                    sym ? "sym" : "asym", c.M, c.N, c.K, c.gs);
+      }
+
+      // Fused kernel, GEMM path: vs oracle at 1e-3, vs cuBLAS at 2e-3.
+      w4::gpu::gemm_fused(dp, x_d, c_f, c.M);
+      w4::gpu::cuda_check(cudaDeviceSynchronize(), "fused sync");
+      std::vector<__half> c_fused((size_t)c.M * c.N);
+      w4::gpu::cuda_check(cudaMemcpy(c_fused.data(), c_f,
+                                     (size_t)c.M * c.N * sizeof(__half),
+                                     cudaMemcpyDeviceToHost),
+                          "down c fused");
+      double num_f = 0.0, num_x = 0.0;
+      for (size_t j = 0; j < c_ref.size(); ++j) {
+        const double d = (double)__half2float(c_fused[j]) - c_ref[j];
+        num_f += d * d;
+        const double dx =
+            (double)__half2float(c_fused[j]) - (double)__half2float(c_gpu[j]);
+        num_x += dx * dx;
+      }
+      const double rel_f = std::sqrt(num_f / (den > 0.0 ? den : 1.0));
+      const double rel_x = std::sqrt(num_x / (den > 0.0 ? den : 1.0));
+      worst_rel = std::max(worst_rel, rel_f);
+      ++checks;
+      if (rel_f > 1e-3) {
+        ++fails;
+        std::printf("FAIL fused gemm %s M=%d N=%d K=%d gs=%d rel=%.3e\n",
+                    sym ? "sym" : "asym", c.M, c.N, c.K, c.gs, rel_f);
+      }
+      ++checks;
+      if (rel_x > 2e-3) {
+        ++fails;
+        std::printf(
+            "FAIL fused-vs-cublas %s M=%d N=%d K=%d gs=%d rel=%.3e\n",
+            sym ? "sym" : "asym", c.M, c.N, c.K, c.gs, rel_x);
+      }
+
+      cudaFree(c_f);
+
       cudaFree(q_d);
       cudaFree(s_d);
       cudaFree(z_d);
@@ -176,6 +241,40 @@ int main() {
                [&] { w4::gpu::gemm_fp16(h, nullptr, out, out, 2, 2, 2); }),
            "gemm w null");
     cublasDestroy(h);
+
+    // Fused entry contracts: same structural rules as dequant, plus the
+    // activation/output pointers and M.
+    expect(throws_invalid([&] { w4::gpu::gemm_fused(bad_gs0, out, out, 2); }),
+           "fused gs=0");
+    expect(throws_invalid([&] { w4::gpu::gemm_fused(bad_gs7, out, out, 2); }),
+           "fused gs=7");
+    expect(throws_invalid([&] { w4::gpu::gemm_fused(bad_g, out, out, 2); }),
+           "fused G wrong");
+    expect(throws_invalid([&] { w4::gpu::gemm_fused(bad_q, out, out, 2); }),
+           "fused q null");
+    expect(throws_invalid([&] { w4::gpu::gemm_fused(bad_z, out, out, 2); }),
+           "fused asym zeros null");
+    expect(throws_invalid([&] { w4::gpu::gemm_fused(sym_z, out, out, 2); }),
+           "fused sym carries zeros");
+    expect(throws_invalid([&] { w4::gpu::gemm_fused(good, out, out, 0); }),
+           "fused M=0");
+    expect(
+        throws_invalid([&] { w4::gpu::gemm_fused(good, nullptr, out, 2); }),
+        "fused x null");
+    expect(
+        throws_invalid([&] { w4::gpu::gemm_fused(good, out, nullptr, 2); }),
+        "fused c null");
+    {
+      auto bad_n = good;
+      bad_n.N = 0;
+      expect(throws_invalid([&] { w4::gpu::gemm_fused(bad_n, out, out, 2); }),
+             "fused N=0");
+    }
+    // gridDim.y caps at 65535: with mtile 4 the launcher must reject
+    // M > 262140 before any allocation or launch. Only the throw side is
+    // testable here — a passing M would launch against the dummy pointers.
+    expect(throws_invalid([&] { w4::gpu::gemm_fused(good, out, out, 262141); }),
+           "fused M past grid.y bound");
   }
 
   std::printf("gpu: %d checks, %d failures, worst gemm rel L2 = %.3e\n",

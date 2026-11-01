@@ -1,7 +1,8 @@
 # W4A16 Fused Dequant GEMM
 
-**STATUS: R1 complete — packed format, host oracle, two-pass baseline,
-gates, bench harness. R2 is the fused SIMT kernel.**
+**STATUS: R2 complete — fused SIMT kernel landed and gated. Wins 7.3–8.3x
+at M=1 down to 1.4–1.6x at M=16 vs the two-pass baseline; loses at M=64
+(0.4x, SIMT FP32 wall — tensor cores are R3). Governor-pinned numbers.**
 
 ## The kernel
 
@@ -56,6 +57,49 @@ Symmetric dequant: `w = scale * (q - 8)`; asymmetric: `w = scale * (q - z)`.
   plus end-to-end wall, raw reps + device/driver/clock/seed metadata in
   `data/w4a16_baseline_bench.json`. Bandwidth figures are analytic bytes
   moved / time, labeled; the GEMM byte count is the analytic minimum.
+
+## R2 contents (2026-10-31)
+
+- `include/w4/fused.cuh` — fused dequant+GEMM (`gemm_fused`). One warp per
+  group of R output rows, lanes stride packed words along K (coalesced
+  128 B steps); each weight is dequantized once via `dequant_one` and FMA'd
+  into R*MTILE FP32 accumulators; shuffle reduction per row at the end. x
+  is converted to FP32 once per call (per-FMA `__half2float` re-conversion
+  measured as the binding constraint without it). MTILE/R dispatch:
+  M <= 4 -> (pow2(M), 1); M > 4 -> (4, 4) — 128 regs, no spills, 2
+  blocks/SM. MTILE 16/32/64 were measured and rejected (occupancy,
+  register spills, shared-staging bank conflicts). The same `dequant_one` call is the whole
+  dequant path, so the bitwise gate below applies unchanged.
+- Gates (CTest 2/2, zero warnings): everything R1 gated, plus fused
+  dequant bitwise vs `dequant_all` through the `w_out` hook across the
+  same matrix (including M > 16 configs for the m-tiling guards), fused
+  GEMM vs the FP64 oracle at rel L2 <= 1e-3, fused vs cuBLAS output at
+  rel L2 <= 2e-3, and the fused entry-point throw contracts.
+- `benchmarks/bench_fused.cu` — fused vs two-pass re-measured in the same
+  session (ratios immune to cross-session machine state), same shapes as
+  the baseline bench, raw reps + metadata in `data/w4a16_fused_bench.json`.
+
+## R2 numbers (2026-10-31, RTX 5060 Laptop, governor-pinned)
+
+Same-session triad 320.1 GB/s; baseline re-measured in session. Raw reps +
+metadata in `data/w4a16_fused_bench.json`. The pre-committed bar was
+>= 1.5x e2e at decode shapes.
+
+| M | N=4096 | N=14336 |
+|---|---|---|
+| 1 | 7.25x | 8.31x |
+| 8 | 2.28x | 2.88x |
+| 16 | 1.36x | 1.64x |
+| 64 | 0.44x | 0.46x |
+
+M=1 and M=8 clear the bar; M=16 clears it at N=14336 and misses at
+N=4096; M=64 loses outright. The M=64 loss is structural for SIMT FP32:
+N*M*K FMAs on CUDA cores plus packed-W re-reads from m-tiling and x L2
+traffic (~2.4 TB/s measured effective — the kernel is L2-bound before it
+is FMA-bound). Both are exactly what WMMA fragment tiling removes, which
+is the R3 justification. An unpinned run earlier the same day showed the
+same ordering at lower magnitude (M=1 5.8–7.3x, M=64 0.36–0.45x); the
+pinned numbers above are the record.
 
 ## Pinned numbers (2026-10-30, RTX 5060 Laptop, governor-pinned idle machine)
 
