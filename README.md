@@ -1,10 +1,11 @@
 # W4A16 Fused Dequant GEMM
 
-**STATUS: R4 complete — MXFP4 kernel rung (naive two-pass, fused SIMT,
-fused WMMA) gated on the full matrix; same dispatch picture as W4 (SIMT
-wins M <= 16, MMA wins M=64). Format-accuracy figure recorded: MXFP4 and
-W4A16 gs=128 symmetric land at the same rel L2 on Gaussian weights.
-Pinned rerun owed.**
+**STATUS: R5 complete — KV-cache-quantized decode attention landed and
+gated (W4 cache, dequant at load in both K and V phases). Wins the
+two-pass everywhere (1.4–4.3x); vs an FP16-cache fused baseline it loses
+at small caches and wins once the FP16 cache spills L2 (1.15x at 64 MB) —
+the output phase is instruction-bound before it is byte-bound. R4 (MXFP4)
+complete before it. Pinned rerun owed.**
 
 ## The kernel
 
@@ -159,6 +160,63 @@ stays fixed). Best-of-dispatch vs baseline: SIMT M=1 7.5/7.7x, M=8
 2.2/2.9x, M=16 1.4/1.6x; MMA M=64 1.4/1.7x. A pinned-governor rerun is
 owed and is the authority on all of this.
 
+## R5 contents (2026-10-31 — KV-cache decode attention)
+
+- `include/w4/kvcache.hpp` (scaffold commit) — the cache as H independent
+  slabs of the existing PackedW format: positions are rows, head dim is
+  the contracted axis, groups partition D. The R1 quantizer and all its
+  contracts carry over unchanged. Plus the FP64 reference attention
+  (double-accumulated scores over the FP16-exact dequantized cache,
+  max-subtracted softmax) and host gates: slab layout memcmp'd against
+  independent per-head quantization, a hand pin (zero keys -> uniform
+  softmax -> exact mean of the V rows), softmax stability at score
+  magnitudes ~3e4, throw contracts.
+- `include/w4/kvattention.cuh` (kernel commit) — `attention_fp16` (the
+  FP16-cache baseline, same kernel shape, so the comparison isolates
+  cache bytes) and `attention_w4` (dequant at load: K in the score phase,
+  V in the output phase, `dequant_one` unchanged). One block per head;
+  warp-per-position scores with shuffle reduction; softmax as two
+  block-wide reductions (max, then sum); threads stride D for the output
+  sum with probabilities broadcast from shared. The query is staged in
+  shared once. Static shared bounds with hard entry throws: S <= 4096
+  (scores, 16 KB) and D <= 512 (query stage, 2 KB) — past that wants
+  flash-style online softmax over tiles, which is a different kernel.
+- Gates: `k_out`/`v_out` hooks reproduce `dequant_head` bitwise per head;
+  output vs the FP64 reference at rel L2 <= 1e-3; vs the device two-pass
+  (per-head dequant + FP16 attention) at 2e-3. Configs cover S=1, ragged
+  words (D=96), both sign modes, and S=4096 exactly on the bound. CTest
+  2/2, 319 checks, zero warnings.
+- `benchmarks/bench_attention.cu` — FP16 fused vs W4 fused vs two-pass,
+  same session, MHA (H=32) and GQA (H=8) head counts; raw reps + metadata
+  in `data/w4a16_kv_bench.json`.
+
+## R5 numbers (2026-10-31, RTX 5060 Laptop, UNPINNED powersave governor)
+
+Same-session triad 264.5 GB/s. W4 fused vs the two denominators:
+
+| H | S | vs two-pass | vs FP16 fused |
+|---|---|---|---|
+| 32 | 512 | 4.32x | 0.85x |
+| 32 | 2048 | 2.47x | 0.57x |
+| 32 | 4096 | 2.55x | 1.15x |
+| 8 | 512 | 1.83x | 0.90x |
+| 8 | 2048 | 1.45x | 0.90x |
+| 8 | 4096 | 1.41x | 0.89x |
+
+Read this honestly. The fusion win over the two-pass is real and
+everywhere — the dequant round-trip to DRAM is eliminated as in the GEMM
+rungs. But against the FP16-cache fused baseline the quantized kernel
+only wins at the largest cache, and loses or washes below it. The output
+phase is instruction-bound (per-element dequant with 8-way redundant word
+touches — 32-44 GB/s effective, nowhere near triad), not byte-bound; the
+4x byte savings only pay once the FP16 cache spills out of L2 (64 MB at
+H=32/S=4096, where the FP16 path degrades 220 -> 110 GB/s while the 16 MB
+packed cache stays resident). The win that exists is cache-residency
+extension — the quantization argument that actually holds for long-context
+decode. The named lever for the small-cache loss is a chunk-staged
+shared-memory V pass (dequant a position tile once, not per output
+element); recorded, not done.
+
 ## R2 contents (2026-10-31)
 
 - `include/w4/fused.cuh` — fused dequant+GEMM (`gemm_fused`). One warp per
@@ -228,8 +286,9 @@ dequant, read W in the GEMM) that a fused kernel eliminates entirely.
 
 ## Stretch
 
-- MXFP4/FP8 block-scaled variants; emulated formats on hardware without
-  native FP4; KV-cache-quantized attention as a second kernel.
+- FP8 block-scaled variants; emulated formats on hardware without native
+  FP4; flash-style online softmax over cache tiles past S=4096; the
+  chunk-staged V pass named in the R5 numbers.
 
 ## Ceiling honesty
 

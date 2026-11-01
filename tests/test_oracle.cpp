@@ -5,8 +5,10 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
+#include "w4/kvcache.hpp"
 #include "w4/mx.hpp"
 #include "w4/pack.hpp"
 
@@ -293,6 +295,128 @@ int main() {
       bad_sizes.q.resize(3);
       expect(throws_invalid([&] { w4::mx::dequant_all_mx(bad_sizes); }),
              "mx dequant size");
+    }
+  }
+
+  // ---- KV-cache attention (R5) host gates ----
+  // The cache is H slabs of PackedW (N=S positions, K=D head dim); the
+  // gates cover the slab layout against independent per-head quantization,
+  // the FP64 reference attention against a hand pin, softmax max
+  // subtraction at overflow-class score magnitudes, and the throw
+  // contracts.
+  {
+    // Layout: quantize_cache over H heads must reproduce, slab for slab,
+    // what independent per-head quantize calls produce.
+    for (const bool sym : {true, false}) {
+      const int H = 3, S = 5, D = 24, gs = 8;
+      const auto ksrc = w4::normal_weights(H * S * D, 0xC1U);
+      const auto vsrc = w4::normal_weights(H * S * D, 0xC2U);
+      const auto c = w4::kv::quantize_cache(ksrc, vsrc, H, S, D, 8, sym);
+      for (int h = 0; h < H; ++h) {
+        const auto ki = w4::dequant_all(w4::quantize(
+            std::vector<double>(ksrc.begin() + (size_t)h * S * D,
+                                ksrc.begin() + (size_t)(h + 1) * S * D),
+            S, D, gs, sym));
+        const auto kh = w4::kv::dequant_head(c, h, false);
+        ++checks;
+        if (std::memcmp(ki.data(), kh.data(), (size_t)S * D * sizeof(__half)) !=
+            0) {
+          ++fails;
+          std::printf("FAIL kv layout %s h=%d\n", sym ? "sym" : "asym", h);
+        }
+      }
+    }
+
+    // Hand pin: k all zeros -> scores all zero -> softmax uniform -> output
+    // is the mean of the two V rows, computed in the same accumulation
+    // order, so the match is exact.
+    {
+      const int H = 1, S = 2, D = 8;
+      const std::vector<double> k(H * S * D, 0.0);
+      std::vector<double> v(H * S * D, 0.0);
+      for (int d = 0; d < D; ++d) {
+        v[d] = 1.0;
+        v[D + d] = 3.0;
+      }
+      const auto c = w4::kv::quantize_cache(k, v, H, S, D, 8, true);
+      const auto vdq = w4::kv::dequant_head(c, 0, true);
+      const std::vector<__half> q(H * D, __float2half_rn(1.0f));
+      const auto out = w4::kv::attention_reference(q, c);
+      for (int d = 0; d < D; ++d) {
+        const double want = 0.5 * (double)__half2float(vdq[d]) +
+                            0.5 * (double)__half2float(vdq[D + d]);
+        ++checks;
+        if (out[d] != want) {
+          ++fails;
+          std::printf("FAIL kv pin d=%d: got %g want %g\n", d, out[d], want);
+        }
+      }
+    }
+
+    // Softmax stability: scores of magnitude ~3e4 overflow a naive exp;
+    // max subtraction keeps the result finite and correct (uniform here).
+    {
+      const int H = 1, S = 2, D = 8;
+      const std::vector<double> k(H * S * D, 100.0);
+      const std::vector<double> v(H * S * D, 0.5);
+      const auto c = w4::kv::quantize_cache(k, v, H, S, D, 8, true);
+      const std::vector<__half> q(H * D, __float2half_rn(100.0f));
+      const auto out = w4::kv::attention_reference(q, c);
+      ++checks;
+      if (!std::isfinite(out[0])) {
+        ++fails;
+        std::printf("FAIL kv softmax overflow: got %g\n", out[0]);
+      }
+      const auto vdq = w4::kv::dequant_head(c, 0, true);
+      ++checks;
+      if (out[0] != (double)__half2float(vdq[0])) {
+        ++fails;
+        std::printf("FAIL kv softmax value: got %g\n", out[0]);
+      }
+    }
+
+    // Throw contracts.
+    {
+      auto throws_invalid = [](auto&& f) {
+        try {
+          f();
+        } catch (const std::invalid_argument&) {
+          return true;
+        } catch (...) {
+        }
+        return false;
+      };
+      auto expect = [&](bool ok, const char* name) {
+        ++checks;
+        if (!ok) {
+          ++fails;
+          std::printf("FAIL kv no-throw: %s\n", name);
+        }
+      };
+      const std::vector<double> ok(1 * 4 * 8, 0.5);
+      expect(throws_invalid(
+                 [&] { w4::kv::quantize_cache(ok, ok, 0, 4, 8, 8, true); }),
+             "kv H=0");
+      expect(throws_invalid(
+                 [&] { w4::kv::quantize_cache(ok, ok, 1, 4, 8, 7, true); }),
+             "kv gs=7");
+      expect(throws_invalid([&] {
+               w4::kv::quantize_cache(std::vector<double>(10), ok, 1, 4, 8, 8,
+                                      true);
+             }),
+             "kv size mismatch");
+      auto c = w4::kv::quantize_cache(ok, ok, 1, 4, 8, 8, true);
+      auto bad = c;
+      bad.G = 2;
+      expect(throws_invalid([&] { w4::kv::dequant_head(bad, 0, false); }),
+             "kv G inconsistent");
+      expect(throws_invalid([&] { w4::kv::dequant_head(c, 1, false); }),
+             "kv h out of range");
+      const std::vector<__half> q(8, __float2half_rn(1.0f));
+      expect(throws_invalid(
+                 [&] { w4::kv::attention_reference(std::vector<__half>(3), c); }),
+             "kv q size");
+      (void)q;
     }
   }
 

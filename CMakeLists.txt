@@ -74,3 +74,10 @@ target_compile_options(bench_mx PRIVATE -Wall -Wextra)
 target_compile_definitions(bench_mx PRIVATE
   W4_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data"
   W4_BUILD_TYPE="${CMAKE_BUILD_TYPE}")
+
+add_executable(bench_attention benchmarks/bench_attention.cu)
+target_link_libraries(bench_attention PRIVATE w4 CUDA::cublas)
+target_compile_options(bench_attention PRIVATE -Wall -Wextra)
+target_compile_definitions(bench_attention PRIVATE
+  W4_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data"
+  W4_BUILD_TYPE="${CMAKE_BUILD_TYPE}")

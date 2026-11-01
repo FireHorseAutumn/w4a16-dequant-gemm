@@ -21,6 +21,12 @@
 //      gate set against the MXFP4 host reference — bitwise dequant, oracle
 //      at 1e-3, cuBLAS at 2e-3, entry contracts including the 2^31 bound on
 //      the naive dequant launch.
+//   7. KV-cache decode attention (attention_w4): k_out/v_out hooks reproduce
+//      dequant_head bitwise per head, output vs the FP64 host reference at
+//      rel L2 <= 1e-3, vs the device two-pass (dequant + FP16 attention) at
+//      2e-3. Configs cover S=1, ragged words (D=96), both sign modes, and
+//      S=4096 exactly on the shared-memory bound; entry contracts throw
+//      past it.
 
 #include <cstdio>
 #include <cstring>
@@ -28,6 +34,7 @@
 
 #include "w4/dequant.cuh"
 #include "w4/fused.cuh"
+#include "w4/kvattention.cuh"
 #include "w4/mma.cuh"
 #include "w4/mxfused.cuh"
 
@@ -414,6 +421,202 @@ int main() {
     cudaFree(c_f);
   }
 
+  // KV-cache decode attention (R5): fused dequant-at-load vs the FP64 host
+  // reference at rel L2 <= 1e-3 and vs the device two-pass (per-head
+  // dequant -> FP16 attention) at 2e-3; the k_out/v_out hooks must
+  // reproduce dequant_head bitwise. S=1 is the single-position edge;
+  // D=96/gs=32 exercises ragged words; S=4096 sits exactly on the shared
+  // bound.
+  {
+    struct KvCfg {
+      int H, S, D, gs;
+    };
+    const std::vector<KvCfg> kcfgs = {
+        {1, 1, 64, 32},      {2, 7, 64, 8},      {4, 128, 128, 128},
+        {2, 300, 96, 32},    {3, 65, 40, 8},     {1, 4096, 64, 64},
+    };
+    for (const bool sym : {true, false}) {
+      for (size_t i = 0; i < kcfgs.size(); ++i) {
+        const KvCfg c = kcfgs[i];
+        const uint64_t seed = 0x77B5ULL ^ (uint64_t)(i * 977 + (sym ? 0 : 1));
+        const auto k_src = w4::normal_weights(c.H * c.S * c.D, seed);
+        const auto v_src = w4::normal_weights(c.H * c.S * c.D, seed + 1);
+        const auto cc =
+            w4::kv::quantize_cache(k_src, v_src, c.H, c.S, c.D, c.gs, sym);
+        const auto q = w4::normal_activations(c.H * c.D, seed + 2);
+        const auto ref = w4::kv::attention_reference(q, cc);
+
+        const int wd = w4::words(c.D);
+        const size_t nq = (size_t)c.H * c.S * wd;
+        const size_t ns = (size_t)c.H * c.S * cc.G;
+        const size_t nz = (size_t)c.H * c.S * w4::words(cc.G);
+        const size_t ne = (size_t)c.H * c.S * c.D;
+        uint32_t *qk_d = nullptr, *qv_d = nullptr, *zk_d = nullptr,
+                 *zv_d = nullptr;
+        __half *sk_d = nullptr, *sv_d = nullptr, *q_d = nullptr,
+               *o_d = nullptr, *o16_d = nullptr, *k16_d = nullptr,
+               *v16_d = nullptr, *ko_d = nullptr, *vo_d = nullptr;
+        w4::gpu::cuda_check(cudaMalloc(&qk_d, nq * sizeof(uint32_t)), "kv qk");
+        w4::gpu::cuda_check(cudaMalloc(&qv_d, nq * sizeof(uint32_t)), "kv qv");
+        w4::gpu::cuda_check(cudaMalloc(&sk_d, ns * sizeof(__half)), "kv sk");
+        w4::gpu::cuda_check(cudaMalloc(&sv_d, ns * sizeof(__half)), "kv sv");
+        if (!sym) {
+          w4::gpu::cuda_check(cudaMalloc(&zk_d, nz * sizeof(uint32_t)),
+                              "kv zk");
+          w4::gpu::cuda_check(cudaMalloc(&zv_d, nz * sizeof(uint32_t)),
+                              "kv zv");
+        }
+        w4::gpu::cuda_check(
+            cudaMalloc(&q_d, (size_t)c.H * c.D * sizeof(__half)), "kv q");
+        w4::gpu::cuda_check(
+            cudaMalloc(&o_d, (size_t)c.H * c.D * sizeof(__half)), "kv o");
+        w4::gpu::cuda_check(
+            cudaMalloc(&o16_d, (size_t)c.H * c.D * sizeof(__half)), "kv o16");
+        w4::gpu::cuda_check(cudaMalloc(&k16_d, ne * sizeof(__half)), "kv k16");
+        w4::gpu::cuda_check(cudaMalloc(&v16_d, ne * sizeof(__half)), "kv v16");
+        w4::gpu::cuda_check(cudaMalloc(&ko_d, ne * sizeof(__half)), "kv ko");
+        w4::gpu::cuda_check(cudaMalloc(&vo_d, ne * sizeof(__half)), "kv vo");
+        w4::gpu::cuda_check(cudaMemcpy(qk_d, cc.q_k.data(),
+                                       nq * sizeof(uint32_t),
+                                       cudaMemcpyHostToDevice),
+                            "up kv qk");
+        w4::gpu::cuda_check(cudaMemcpy(qv_d, cc.q_v.data(),
+                                       nq * sizeof(uint32_t),
+                                       cudaMemcpyHostToDevice),
+                            "up kv qv");
+        w4::gpu::cuda_check(cudaMemcpy(sk_d, cc.s_k.data(),
+                                       ns * sizeof(__half),
+                                       cudaMemcpyHostToDevice),
+                            "up kv sk");
+        w4::gpu::cuda_check(cudaMemcpy(sv_d, cc.s_v.data(),
+                                       ns * sizeof(__half),
+                                       cudaMemcpyHostToDevice),
+                            "up kv sv");
+        if (!sym) {
+          w4::gpu::cuda_check(cudaMemcpy(zk_d, cc.z_k.data(),
+                                         nz * sizeof(uint32_t),
+                                         cudaMemcpyHostToDevice),
+                              "up kv zk");
+          w4::gpu::cuda_check(cudaMemcpy(zv_d, cc.z_v.data(),
+                                         nz * sizeof(uint32_t),
+                                         cudaMemcpyHostToDevice),
+                              "up kv zv");
+        }
+        w4::gpu::cuda_check(cudaMemcpy(q_d, q.data(),
+                                       (size_t)c.H * c.D * sizeof(__half),
+                                       cudaMemcpyHostToDevice),
+                            "up kv q");
+
+        // Two-pass: per-head dequant through the R1 kernel (itself bitwise
+        // gated), then the FP16 attention kernel.
+        for (int h = 0; h < c.H; ++h) {
+          const w4::gpu::DevicePackedW dk{c.S, c.D, c.gs, cc.G, sym ? 1 : 0,
+                                          qk_d + (size_t)h * c.S * wd,
+                                          sk_d + (size_t)h * c.S * cc.G,
+                                          zk_d ? zk_d + (size_t)h * c.S *
+                                                     w4::words(cc.G)
+                                               : nullptr};
+          w4::gpu::dequant(dk, k16_d + (size_t)h * c.S * c.D);
+          const w4::gpu::DevicePackedW dv{c.S, c.D, c.gs, cc.G, sym ? 1 : 0,
+                                          qv_d + (size_t)h * c.S * wd,
+                                          sv_d + (size_t)h * c.S * cc.G,
+                                          zv_d ? zv_d + (size_t)h * c.S *
+                                                     w4::words(cc.G)
+                                               : nullptr};
+          w4::gpu::dequant(dv, v16_d + (size_t)h * c.S * c.D);
+        }
+        w4::gpu::attention_fp16(q_d, k16_d, v16_d, o16_d, c.H, c.S, c.D);
+
+        // Fused with the dequant hooks armed.
+        const w4::gpu::DeviceKVW4 dp{c.H,    c.S,    c.D, c.gs, cc.G,
+                                     sym ? 1 : 0,    qk_d,  sk_d, zk_d,
+                                     qv_d,   sv_d,   zv_d};
+        w4::gpu::attention_w4(dp, q_d, o_d, 0, ko_d, vo_d);
+        w4::gpu::cuda_check(cudaDeviceSynchronize(), "kv fused hooks");
+
+        // Bitwise: the hooks must reproduce the host dequant, and the
+        // two-pass FP16 caches must match the same reference.
+        std::vector<__half> buf(ne);
+        bool k_ok = true, v_ok = true;
+        for (int h = 0; h < c.H; ++h) {
+          const auto kref = w4::kv::dequant_head(cc, h, false);
+          const auto vref = w4::kv::dequant_head(cc, h, true);
+          w4::gpu::cuda_check(cudaMemcpy(buf.data(),
+                                         ko_d + (size_t)h * c.S * c.D,
+                                         (size_t)c.S * c.D * sizeof(__half),
+                                         cudaMemcpyDeviceToHost),
+                              "down kv ko");
+          if (std::memcmp(buf.data(), kref.data(),
+                          (size_t)c.S * c.D * sizeof(__half)) != 0)
+            k_ok = false;
+          w4::gpu::cuda_check(cudaMemcpy(buf.data(),
+                                         vo_d + (size_t)h * c.S * c.D,
+                                         (size_t)c.S * c.D * sizeof(__half),
+                                         cudaMemcpyDeviceToHost),
+                              "down kv vo");
+          if (std::memcmp(buf.data(), vref.data(),
+                          (size_t)c.S * c.D * sizeof(__half)) != 0)
+            v_ok = false;
+        }
+        ++checks;
+        if (!k_ok || !v_ok) {
+          ++fails;
+          std::printf("FAIL kv dequant bitwise %s H=%d S=%d D=%d gs=%d\n",
+                      sym ? "sym" : "asym", c.H, c.S, c.D, c.gs);
+        }
+
+        std::vector<__half> o_gpu((size_t)c.H * c.D);
+        w4::gpu::cuda_check(cudaMemcpy(o_gpu.data(), o_d,
+                                       (size_t)c.H * c.D * sizeof(__half),
+                                       cudaMemcpyDeviceToHost),
+                            "down kv o");
+        std::vector<__half> o_16((size_t)c.H * c.D);
+        w4::gpu::cuda_check(cudaMemcpy(o_16.data(), o16_d,
+                                       (size_t)c.H * c.D * sizeof(__half),
+                                       cudaMemcpyDeviceToHost),
+                            "down kv o16");
+        double num_r = 0.0, num_t = 0.0, den = 0.0;
+        for (size_t j = 0; j < o_gpu.size(); ++j) {
+          const double d = (double)__half2float(o_gpu[j]) - ref[j];
+          num_r += d * d;
+          const double dt =
+              (double)__half2float(o_gpu[j]) - (double)__half2float(o_16[j]);
+          num_t += dt * dt;
+          den += ref[j] * ref[j];
+        }
+        const double rel_r = std::sqrt(num_r / (den > 0.0 ? den : 1.0));
+        const double rel_t = std::sqrt(num_t / (den > 0.0 ? den : 1.0));
+        worst_rel = std::max(worst_rel, rel_r);
+        ++checks;
+        if (rel_r > 1e-3) {
+          ++fails;
+          std::printf("FAIL kv oracle %s H=%d S=%d D=%d gs=%d rel=%.3e\n",
+                      sym ? "sym" : "asym", c.H, c.S, c.D, c.gs, rel_r);
+        }
+        ++checks;
+        if (rel_t > 2e-3) {
+          ++fails;
+          std::printf("FAIL kv two-pass %s H=%d S=%d D=%d gs=%d rel=%.3e\n",
+                      sym ? "sym" : "asym", c.H, c.S, c.D, c.gs, rel_t);
+        }
+
+        cudaFree(qk_d);
+        cudaFree(qv_d);
+        cudaFree(zk_d);
+        cudaFree(zv_d);
+        cudaFree(sk_d);
+        cudaFree(sv_d);
+        cudaFree(q_d);
+        cudaFree(o_d);
+        cudaFree(o16_d);
+        cudaFree(k16_d);
+        cudaFree(v16_d);
+        cudaFree(ko_d);
+        cudaFree(vo_d);
+      }
+    }
+  }
+
   cublasDestroy(cb);
 
   // Host-side entry contracts: every malformed launch must throw before any
@@ -555,6 +758,49 @@ int main() {
            "mx mma x null");
     expect(throws_invalid([&] { w4::gpu::gemm_mma_mx(good_mx, out, out, 0); }),
            "mx mma M=0");
+
+    // KV attention entry contracts: dims, the S/D shared-memory bounds, gs,
+    // G consistency, null pointers, zeros discipline.
+    const w4::gpu::DeviceKVW4 good_kv{1, 4, 8, 8, 1, 1,
+                                      (const uint32_t*)1, (const __half*)1,
+                                      nullptr,
+                                      (const uint32_t*)1, (const __half*)1,
+                                      nullptr};
+    auto kv_s0 = good_kv; kv_s0.S = 0;
+    auto kv_big_s = good_kv; kv_big_s.S = 4097;
+    auto kv_big_d = good_kv; kv_big_d.D = 513;
+    auto kv_gs = good_kv; kv_gs.gs = 7;
+    auto kv_g = good_kv; kv_g.G = 2;
+    auto kv_q = good_kv; kv_q.q_k = nullptr;
+    auto kv_z = good_kv; kv_z.symmetric = 0;
+    auto kv_sz = good_kv; kv_sz.z_k = (const uint32_t*)1;
+    expect(throws_invalid([&] { w4::gpu::attention_w4(kv_s0, out, out); }),
+           "kv S=0");
+    expect(throws_invalid([&] { w4::gpu::attention_w4(kv_big_s, out, out); }),
+           "kv S=4097");
+    expect(throws_invalid([&] { w4::gpu::attention_w4(kv_big_d, out, out); }),
+           "kv D=513");
+    expect(throws_invalid([&] { w4::gpu::attention_w4(kv_gs, out, out); }),
+           "kv gs=7");
+    expect(throws_invalid([&] { w4::gpu::attention_w4(kv_g, out, out); }),
+           "kv G wrong");
+    expect(throws_invalid([&] { w4::gpu::attention_w4(kv_q, out, out); }),
+           "kv q null");
+    expect(throws_invalid([&] { w4::gpu::attention_w4(kv_z, out, out); }),
+           "kv asym zeros null");
+    expect(throws_invalid([&] { w4::gpu::attention_w4(kv_sz, out, out); }),
+           "kv sym carries zeros");
+    expect(
+        throws_invalid([&] { w4::gpu::attention_w4(good_kv, nullptr, out); }),
+        "kv x null");
+    expect(throws_invalid([&] { w4::gpu::attention_w4(good_kv, out, nullptr); }),
+           "kv out null");
+    expect(throws_invalid(
+               [&] { w4::gpu::attention_fp16(out, out, out, out, 1, 5000, 8); }),
+           "kv fp16 S bound");
+    expect(throws_invalid(
+               [&] { w4::gpu::attention_fp16(nullptr, out, out, out, 1, 4, 8); }),
+           "kv fp16 q null");
   }
 
   std::printf("gpu: %d checks, %d failures, worst gemm rel L2 = %.3e\n",
