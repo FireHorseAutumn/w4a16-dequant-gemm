@@ -583,4 +583,175 @@ inline void attention_f8_flash(const DeviceKVF8& p, const __half* q,
   cuda_check(cudaGetLastError(), "flash_phase2");
 }
 
+// Paged W4 flash (R7): the same split-S structure, with positions resolved
+// through the block table — logical position t lives at physical row
+// bt[t/page]*page + t%page of the head's pool slab (npages*page rows per
+// head). Tiles partition the LOGICAL range, so every position is still
+// touched exactly once and the k_out/v_out hooks reproduce the contiguous
+// dequant bitwise (hooks write by logical position).
+__global__ void flash_w4_paged_phase1(const DeviceKVW4 p,
+                                      const __half* __restrict__ q,
+                                      const int* __restrict__ bt,
+                                      const int page, const int pool_rows,
+                                      float* __restrict__ part,
+                                      __half* __restrict__ k_out,
+                                      __half* __restrict__ v_out) {
+  __shared__ float q_sh[KV_MAX_D];
+  __shared__ float sc[FLASH_TILE];
+  __shared__ float acc[KV_MAX_D];
+  __shared__ float red[8];
+  const int h = blockIdx.x, tile = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31, wid = tid >> 5;
+  const int S = p.S, D = p.D;
+  const int wd = words(D);
+  const int t0 = tile * FLASH_TILE;
+  const int t1 = min(S, t0 + FLASH_TILE);
+  const float inv_sqrt_d = rsqrtf((float)D);
+
+  for (int d = tid; d < D; d += 256) {
+    q_sh[d] = __half2float(q[(size_t)h * D + d]);
+    acc[d] = 0.0f;
+  }
+  __syncthreads();
+
+  // Per-head pool slab strides use the pool row count, not S.
+  const size_t off_q = (size_t)h * pool_rows * wd;
+  const size_t off_s = (size_t)h * pool_rows * p.G;
+  const size_t off_z = (size_t)h * pool_rows * words(p.G);
+
+  for (int t = t0 + wid; t < t1; t += 8) {
+    const int row = bt[t / page] * page + (t % page);
+    float a = 0.0f;
+    for (int w = lane; w < wd; w += 32) {
+      const int k0 = 8 * w;
+      const int g = k0 / p.gs;
+      const __half s = p.s_k[off_s + (size_t)row * p.G + g];
+      const int z =
+          p.symmetric
+              ? 8
+              : (int)((p.z_k[off_z + (size_t)row * words(p.G) + g / 8] >>
+                       (4 * (g % 8))) &
+                      0xF);
+      const uint32_t qw = p.q_k[off_q + (size_t)row * wd + w];
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const int k = k0 + j;
+        if (k >= D) break;
+        const __half wj = dequant_one(s, (int)((qw >> (4 * j)) & 0xF), z);
+        if (k_out) k_out[(size_t)h * S * D + (size_t)t * D + k] = wj;
+        a += q_sh[k] * __half2float(wj);
+      }
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+      a += __shfl_down_sync(0xffffffffu, a, o);
+    if (lane == 0) sc[t - t0] = a * inv_sqrt_d;
+  }
+  __syncthreads();
+
+  {
+    float m = -CUDART_INF_F;
+    for (int t = wid * 32 + lane; t < t1 - t0; t += 256) m = fmaxf(m, sc[t]);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+      m = fmaxf(m, __shfl_down_sync(0xffffffffu, m, o));
+    if (lane == 0) red[wid] = m;
+    __syncthreads();
+    if (tid == 0) {
+      float mm = red[0];
+#pragma unroll
+      for (int i = 1; i < 8; ++i) mm = fmaxf(mm, red[i]);
+      red[0] = mm;
+    }
+    __syncthreads();
+  }
+  const float m = red[0];
+  float l = 0.0f;
+  for (int t = tid; t < t1 - t0; t += 256) {
+    const float e = __expf(sc[t] - m);
+    sc[t] = e;
+    l += e;
+  }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1)
+    l += __shfl_down_sync(0xffffffffu, l, o);
+  __syncthreads();
+  if (lane == 0) red[wid] = l;
+  __syncthreads();
+  if (tid == 0) {
+    float ss = red[0];
+#pragma unroll
+    for (int i = 1; i < 8; ++i) ss += red[i];
+    red[1] = ss;
+  }
+  __syncthreads();
+
+  for (int d = tid; d < D; d += 256) {
+    const int w = d / 8, j = d % 8, g = d / p.gs;
+    float a = 0.0f;
+    for (int t = t0; t < t1; ++t) {
+      const int row = bt[t / page] * page + (t % page);
+      const __half s = p.s_v[off_s + (size_t)row * p.G + g];
+      const int z =
+          p.symmetric
+              ? 8
+              : (int)((p.z_v[off_z + (size_t)row * words(p.G) + g / 8] >>
+                       (4 * (g % 8))) &
+                      0xF);
+      const uint32_t qw = p.q_v[off_q + (size_t)row * wd + w];
+      const __half vj = dequant_one(s, (int)((qw >> (4 * j)) & 0xF), z);
+      if (v_out) v_out[(size_t)h * S * D + (size_t)t * D + d] = vj;
+      a += sc[t - t0] * __half2float(vj);
+    }
+    acc[d] = a;
+  }
+  __syncthreads();
+
+  float* base = part + ((size_t)h * gridDim.y + tile) * (D + 2);
+  if (tid == 0) {
+    base[0] = m;
+    base[1] = red[1];
+  }
+  for (int d = tid; d < D; d += 256) base[2 + d] = acc[d];
+}
+
+inline void attention_w4_flash_paged(const DeviceKVW4& p, const int* bt,
+                                     int page, int npages, const __half* q,
+                                     __half* out, cudaStream_t stream = 0,
+                                     __half* k_out = nullptr,
+                                     __half* v_out = nullptr) {
+  // p.S is the logical position count; the pool slab per head has
+  // npages*page rows. Host-side structural validation lives in
+  // validate_paged; this is the device contract.
+  if (p.H < 1 || p.S < 1 || p.D < 1)
+    throw std::invalid_argument("kv paged flash: bad dims");
+  if (p.D > KV_MAX_D)
+    throw std::invalid_argument("kv paged flash: D exceeds the shared bound");
+  if (p.gs < 8 || p.gs % 8 != 0)
+    throw std::invalid_argument("kv paged flash: gs must be a multiple of 8");
+  if (p.G != (p.D + p.gs - 1) / p.gs)
+    throw std::invalid_argument("kv paged flash: G inconsistent with D, gs");
+  if (!p.q_k || !p.s_k || !p.q_v || !p.s_v || !bt)
+    throw std::invalid_argument("kv paged flash: null pointer");
+  if (!p.symmetric && (!p.z_k || !p.z_v))
+    throw std::invalid_argument("kv paged flash: asymmetric without zeros");
+  if (p.symmetric && (p.z_k || p.z_v))
+    throw std::invalid_argument("kv paged flash: symmetric carries zeros");
+  if (page < 1 || npages < 1 || (size_t)npages * page < (size_t)p.S)
+    throw std::invalid_argument("kv paged flash: bad page geometry");
+  if (p.S > 65535 * FLASH_TILE)
+    throw std::invalid_argument("kv paged flash: S exceeds tile-grid bound");
+  if (!q || !out) throw std::invalid_argument("kv paged flash: null io");
+
+  const int T = (p.S + FLASH_TILE - 1) / FLASH_TILE;
+  float* part = kv_part_scratch((size_t)p.H * T * (p.D + 2));
+  const dim3 grid((unsigned)p.H, (unsigned)T);
+  flash_w4_paged_phase1<<<grid, 256, 0, stream>>>(
+      p, q, bt, page, npages * page, part, k_out, v_out);
+  cuda_check(cudaGetLastError(), "flash_w4_paged_phase1");
+  flash_phase2<<<p.H, 256, 0, stream>>>(part, out, T, p.D);
+  cuda_check(cudaGetLastError(), "flash_phase2");
+}
+
 }  // namespace w4::gpu

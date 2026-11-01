@@ -36,6 +36,7 @@
 #include "w4/fused.cuh"
 #include "w4/kvattention.cuh"
 #include "w4/kvflash.cuh"
+#include "w4/kvpaged.hpp"
 #include "w4/mma.cuh"
 #include "w4/mxfused.cuh"
 
@@ -1003,6 +1004,395 @@ int main() {
     }
   }
 
+  // Paged flash (R7): positions resolve through the block table. Gates:
+  // paged output bitwise vs the contiguous flash kernel on the same
+  // logical cache (deterministic kernels, identical logical bytes), hooks
+  // bitwise vs dequant_head in logical order, plus a prefix-shared pool
+  // exhibit below.
+  {
+    struct PCfg {
+      int H, S, D, gs, page;
+    };
+    const std::vector<PCfg> pcfgs = {
+        {2, 300, 96, 32, 16},   // ragged last page
+        {2, 520, 64, 32, 16},   {1, 1000, 128, 64, 64},
+        {3, 65, 40, 8, 32},     // page < gs is fine: groups partition D
+        {1, 5000, 64, 32, 256}, // past the old single-block bound
+    };
+    for (const bool sym : {true, false}) {
+      for (size_t i = 0; i < pcfgs.size(); ++i) {
+        const PCfg c = pcfgs[i];
+        const uint64_t seed = 0x9A6EULL ^ (uint64_t)(i * 977 + (sym ? 0 : 1));
+        const auto k_src = w4::normal_weights(c.H * c.S * c.D, seed);
+        const auto v_src = w4::normal_weights(c.H * c.S * c.D, seed + 1);
+        const auto cc =
+            w4::kv::quantize_cache(k_src, v_src, c.H, c.S, c.D, c.gs, sym);
+        const auto q = w4::normal_activations(c.H * c.D, seed + 2);
+
+        const int npages = (c.S + c.page - 1) / c.page;
+        std::vector<int> bt(npages);
+        std::iota(bt.begin(), bt.end(), 0);
+        std::mt19937_64 shuf(seed ^ 0x5EDULL);
+        std::shuffle(bt.begin(), bt.end(), shuf);  // worst case: shuffled
+        const auto pc = w4::kv::paged_from_contiguous(cc, c.page, bt);
+
+        const int wd = w4::words(c.D);
+        const size_t pool_q = (size_t)c.H * npages * c.page * wd;
+        const size_t pool_s = (size_t)c.H * npages * c.page * cc.G;
+        const size_t pool_z =
+            (size_t)c.H * npages * c.page * w4::words(cc.G);
+        const size_t ne = (size_t)c.H * c.S * c.D;
+        uint32_t *qk_d = nullptr, *qv_d = nullptr, *zk_d = nullptr,
+                 *zv_d = nullptr;
+        __half *sk_d = nullptr, *sv_d = nullptr, *q_d = nullptr,
+               *o_p = nullptr, *o_c = nullptr, *ko_d = nullptr,
+               *vo_d = nullptr;
+        int* bt_d = nullptr;
+        w4::gpu::cuda_check(cudaMalloc(&qk_d, pool_q * sizeof(uint32_t)),
+                            "pg qk");
+        w4::gpu::cuda_check(cudaMalloc(&qv_d, pool_q * sizeof(uint32_t)),
+                            "pg qv");
+        w4::gpu::cuda_check(cudaMalloc(&sk_d, pool_s * sizeof(__half)),
+                            "pg sk");
+        w4::gpu::cuda_check(cudaMalloc(&sv_d, pool_s * sizeof(__half)),
+                            "pg sv");
+        if (!sym) {
+          w4::gpu::cuda_check(cudaMalloc(&zk_d, pool_z * sizeof(uint32_t)),
+                              "pg zk");
+          w4::gpu::cuda_check(cudaMalloc(&zv_d, pool_z * sizeof(uint32_t)),
+                              "pg zv");
+        }
+        w4::gpu::cuda_check(
+            cudaMalloc(&q_d, (size_t)c.H * c.D * sizeof(__half)), "pg q");
+        w4::gpu::cuda_check(cudaMalloc(&o_p, (size_t)c.H * c.D * sizeof(__half)),
+                            "pg op");
+        w4::gpu::cuda_check(cudaMalloc(&o_c, (size_t)c.H * c.D * sizeof(__half)),
+                            "pg oc");
+        w4::gpu::cuda_check(cudaMalloc(&ko_d, ne * sizeof(__half)), "pg ko");
+        w4::gpu::cuda_check(cudaMalloc(&vo_d, ne * sizeof(__half)), "pg vo");
+        w4::gpu::cuda_check(
+            cudaMalloc(&bt_d, npages * sizeof(int)), "pg bt");
+        w4::gpu::cuda_check(cudaMemcpy(qk_d, pc.q_k.data(),
+                                       pool_q * sizeof(uint32_t),
+                                       cudaMemcpyHostToDevice),
+                            "up pg qk");
+        w4::gpu::cuda_check(cudaMemcpy(qv_d, pc.q_v.data(),
+                                       pool_q * sizeof(uint32_t),
+                                       cudaMemcpyHostToDevice),
+                            "up pg qv");
+        w4::gpu::cuda_check(cudaMemcpy(sk_d, pc.s_k.data(),
+                                       pool_s * sizeof(__half),
+                                       cudaMemcpyHostToDevice),
+                            "up pg sk");
+        w4::gpu::cuda_check(cudaMemcpy(sv_d, pc.s_v.data(),
+                                       pool_s * sizeof(__half),
+                                       cudaMemcpyHostToDevice),
+                            "up pg sv");
+        if (!sym) {
+          w4::gpu::cuda_check(cudaMemcpy(zk_d, pc.z_k.data(),
+                                         pool_z * sizeof(uint32_t),
+                                         cudaMemcpyHostToDevice),
+                              "up pg zk");
+          w4::gpu::cuda_check(cudaMemcpy(zv_d, pc.z_v.data(),
+                                         pool_z * sizeof(uint32_t),
+                                         cudaMemcpyHostToDevice),
+                              "up pg zv");
+        }
+        w4::gpu::cuda_check(cudaMemcpy(q_d, q.data(),
+                                       (size_t)c.H * c.D * sizeof(__half),
+                                       cudaMemcpyHostToDevice),
+                            "up pg q");
+        w4::gpu::cuda_check(cudaMemcpy(bt_d, bt.data(),
+                                       npages * sizeof(int),
+                                       cudaMemcpyHostToDevice),
+                            "up pg bt");
+
+        const w4::gpu::DeviceKVW4 dpp{c.H,    c.S,    c.D, c.gs, cc.G,
+                                      sym ? 1 : 0,    qk_d,  sk_d, zk_d,
+                                      qv_d,   sv_d,   zv_d};
+        w4::gpu::attention_w4_flash_paged(dpp, bt_d, c.page, npages, q_d,
+                                          o_p, 0, ko_d, vo_d);
+        w4::gpu::cuda_check(cudaDeviceSynchronize(), "pg sync");
+
+        // Contiguous flash reference on the same logical cache. The
+        // contiguous pool is a prefix view of the packed rows: the pool
+        // holds the same logical content, but through the shuffled table,
+        // so build a compact contiguous upload from the host cache.
+        {
+          const size_t nq = (size_t)c.H * c.S * wd;
+          const size_t ns = (size_t)c.H * c.S * cc.G;
+          const size_t nz = (size_t)c.H * c.S * w4::words(cc.G);
+          uint32_t *cq_d = nullptr, *cv_d = nullptr, *cz_d = nullptr;
+          __half *cs_d = nullptr, *cw_d = nullptr;
+          w4::gpu::cuda_check(cudaMalloc(&cq_d, nq * sizeof(uint32_t)), "cq");
+          w4::gpu::cuda_check(cudaMalloc(&cv_d, nq * sizeof(uint32_t)), "cv");
+          w4::gpu::cuda_check(cudaMalloc(&cs_d, ns * sizeof(__half)), "cs");
+          w4::gpu::cuda_check(cudaMalloc(&cw_d, ns * sizeof(__half)), "cw");
+          if (!sym)
+            w4::gpu::cuda_check(cudaMalloc(&cz_d, nz * sizeof(uint32_t)),
+                                "cz");
+          w4::gpu::cuda_check(cudaMemcpy(cq_d, cc.q_k.data(),
+                                         nq * sizeof(uint32_t),
+                                         cudaMemcpyHostToDevice),
+                              "up cq");
+          w4::gpu::cuda_check(cudaMemcpy(cv_d, cc.q_v.data(),
+                                         nq * sizeof(uint32_t),
+                                         cudaMemcpyHostToDevice),
+                              "up cv");
+          w4::gpu::cuda_check(cudaMemcpy(cs_d, cc.s_k.data(),
+                                         ns * sizeof(__half),
+                                         cudaMemcpyHostToDevice),
+                              "up cs");
+          w4::gpu::cuda_check(cudaMemcpy(cw_d, cc.s_v.data(),
+                                         ns * sizeof(__half),
+                                         cudaMemcpyHostToDevice),
+                              "up cw");
+          uint32_t* cz2 = nullptr;
+          if (!sym) {
+            w4::gpu::cuda_check(cudaMalloc(&cz2, nz * sizeof(uint32_t)),
+                                "cz2");
+            w4::gpu::cuda_check(cudaMemcpy(cz2, cc.z_v.data(),
+                                           nz * sizeof(uint32_t),
+                                           cudaMemcpyHostToDevice),
+                                "up cz2");
+            w4::gpu::cuda_check(cudaMemcpy(cz_d, cc.z_k.data(),
+                                           nz * sizeof(uint32_t),
+                                           cudaMemcpyHostToDevice),
+                                "up cz");
+          }
+          const w4::gpu::DeviceKVW4 dpc{c.H,    c.S,   c.D, c.gs, cc.G,
+                                        sym ? 1 : 0,   cq_d, cs_d, cz_d,
+                                        cv_d,   cw_d,  cz2};
+          w4::gpu::attention_w4_flash(dpc, q_d, o_c);
+          w4::gpu::cuda_check(cudaDeviceSynchronize(), "pg contig sync");
+          cudaFree(cq_d);
+          cudaFree(cv_d);
+          cudaFree(cz_d);
+          cudaFree(cs_d);
+          cudaFree(cw_d);
+          cudaFree(cz2);
+        }
+
+        std::vector<__half> hp((size_t)c.H * c.D), hc((size_t)c.H * c.D);
+        w4::gpu::cuda_check(cudaMemcpy(hp.data(), o_p,
+                                       (size_t)c.H * c.D * sizeof(__half),
+                                       cudaMemcpyDeviceToHost),
+                            "down pg p");
+        w4::gpu::cuda_check(cudaMemcpy(hc.data(), o_c,
+                                       (size_t)c.H * c.D * sizeof(__half),
+                                       cudaMemcpyDeviceToHost),
+                            "down pg c");
+        ++checks;
+        if (std::memcmp(hp.data(), hc.data(),
+                        (size_t)c.H * c.D * sizeof(__half)) != 0) {
+          ++fails;
+          std::printf(
+              "FAIL paged-vs-contiguous bitwise %s H=%d S=%d D=%d page=%d\n",
+              sym ? "sym" : "asym", c.H, c.S, c.D, c.page);
+        }
+        // Hooks: logical-order dequant must reproduce dequant_head bitwise.
+        std::vector<__half> buf(ne);
+        bool k_ok = true, v_ok = true;
+        for (int h = 0; h < c.H; ++h) {
+          const auto kref = w4::kv::dequant_head(cc, h, false);
+          const auto vref = w4::kv::dequant_head(cc, h, true);
+          w4::gpu::cuda_check(cudaMemcpy(buf.data(),
+                                         ko_d + (size_t)h * c.S * c.D,
+                                         (size_t)c.S * c.D * sizeof(__half),
+                                         cudaMemcpyDeviceToHost),
+                              "down pg ko");
+          if (std::memcmp(buf.data(), kref.data(),
+                          (size_t)c.S * c.D * sizeof(__half)) != 0)
+            k_ok = false;
+          w4::gpu::cuda_check(cudaMemcpy(buf.data(),
+                                         vo_d + (size_t)h * c.S * c.D,
+                                         (size_t)c.S * c.D * sizeof(__half),
+                                         cudaMemcpyDeviceToHost),
+                              "down pg vo");
+          if (std::memcmp(buf.data(), vref.data(),
+                          (size_t)c.S * c.D * sizeof(__half)) != 0)
+            v_ok = false;
+        }
+        ++checks;
+        if (!k_ok || !v_ok) {
+          ++fails;
+          std::printf("FAIL paged dequant bitwise %s H=%d S=%d D=%d\n",
+                      sym ? "sym" : "asym", c.H, c.S, c.D);
+        }
+
+        cudaFree(qk_d);
+        cudaFree(qv_d);
+        cudaFree(zk_d);
+        cudaFree(zv_d);
+        cudaFree(sk_d);
+        cudaFree(sv_d);
+        cudaFree(q_d);
+        cudaFree(o_p);
+        cudaFree(o_c);
+        cudaFree(ko_d);
+        cudaFree(vo_d);
+        cudaFree(bt_d);
+      }
+    }
+  }
+
+  // Prefix sharing: one physical pool holds sequence B (S2 positions) and
+  // its own prefix A (S1 < S2) — A's block table is a prefix of B's. Both
+  // decode correctly out of the single shared pool, bitwise vs their
+  // contiguous references.
+  {
+    const int H = 2, D = 64, gs = 32, page = 16, S1 = 200, S2 = 520;
+    for (const bool sym : {true, false}) {
+      const auto k_src = w4::normal_weights(H * S2 * D, 0xBEEF);
+      const auto v_src = w4::normal_weights(H * S2 * D, 0xBEE0);
+      const auto ccB = w4::kv::quantize_cache(k_src, v_src, H, S2, D, gs, sym);
+      const int npages = (S2 + page - 1) / page;  // 33
+      std::vector<int> btB(npages);
+      std::iota(btB.begin(), btB.end(), 0);
+      std::mt19937_64 shuf(0xCAFE);
+      std::shuffle(btB.begin(), btB.end(), shuf);
+      const auto pc = w4::kv::paged_from_contiguous(ccB, page, btB);
+      // A's view: the first ceil(S1/page) entries of B's table.
+      const int na = (S1 + page - 1) / page;  // 13
+      const std::vector<int> btA(btB.begin(), btB.begin() + na);
+      // A's contiguous cache: per-head prefix slices (the source layout is
+      // head-major, so a flat prefix slice would be the wrong rows).
+      std::vector<double> kA((size_t)H * S1 * D), vA((size_t)H * S1 * D);
+      for (int h = 0; h < H; ++h) {
+        std::copy_n(k_src.begin() + (size_t)h * S2 * D, (size_t)S1 * D,
+                    kA.begin() + (size_t)h * S1 * D);
+        std::copy_n(v_src.begin() + (size_t)h * S2 * D, (size_t)S1 * D,
+                    vA.begin() + (size_t)h * S1 * D);
+      }
+      const auto ccA = w4::kv::quantize_cache(kA, vA, H, S1, D, gs, sym);
+      const auto q = w4::normal_activations(H * D, 0xFEED);
+
+      const int wd = w4::words(D);
+      const size_t pool_q = (size_t)H * npages * page * wd;
+      const size_t pool_s = (size_t)H * npages * page * ccB.G;
+      const size_t pool_z = (size_t)H * npages * page * w4::words(ccB.G);
+      uint32_t *qk_d = nullptr, *qv_d = nullptr, *zk_d = nullptr,
+               *zv_d = nullptr;
+      __half *sk_d = nullptr, *sv_d = nullptr, *q_d = nullptr, *o_d = nullptr;
+      int *btB_d = nullptr, *btA_d = nullptr;
+      w4::gpu::cuda_check(cudaMalloc(&qk_d, pool_q * sizeof(uint32_t)), "pf qk");
+      w4::gpu::cuda_check(cudaMalloc(&qv_d, pool_q * sizeof(uint32_t)), "pf qv");
+      w4::gpu::cuda_check(cudaMalloc(&sk_d, pool_s * sizeof(__half)), "pf sk");
+      w4::gpu::cuda_check(cudaMalloc(&sv_d, pool_s * sizeof(__half)), "pf sv");
+      if (!sym) {
+        w4::gpu::cuda_check(cudaMalloc(&zk_d, pool_z * sizeof(uint32_t)),
+                            "pf zk");
+        w4::gpu::cuda_check(cudaMalloc(&zv_d, pool_z * sizeof(uint32_t)),
+                            "pf zv");
+        w4::gpu::cuda_check(cudaMemcpy(zk_d, pc.z_k.data(),
+                                       pool_z * sizeof(uint32_t),
+                                       cudaMemcpyHostToDevice),
+                            "up pf zk");
+        w4::gpu::cuda_check(cudaMemcpy(zv_d, pc.z_v.data(),
+                                       pool_z * sizeof(uint32_t),
+                                       cudaMemcpyHostToDevice),
+                            "up pf zv");
+      }
+      w4::gpu::cuda_check(
+          cudaMalloc(&q_d, (size_t)H * D * sizeof(__half)), "pf q");
+      w4::gpu::cuda_check(
+          cudaMalloc(&o_d, (size_t)H * D * sizeof(__half)), "pf o");
+      w4::gpu::cuda_check(cudaMalloc(&btB_d, npages * sizeof(int)), "pf btB");
+      w4::gpu::cuda_check(cudaMalloc(&btA_d, na * sizeof(int)), "pf btA");
+      w4::gpu::cuda_check(cudaMemcpy(qk_d, pc.q_k.data(),
+                                     pool_q * sizeof(uint32_t),
+                                     cudaMemcpyHostToDevice),
+                          "up pf qk");
+      w4::gpu::cuda_check(cudaMemcpy(qv_d, pc.q_v.data(),
+                                     pool_q * sizeof(uint32_t),
+                                     cudaMemcpyHostToDevice),
+                          "up pf qv");
+      w4::gpu::cuda_check(cudaMemcpy(sk_d, pc.s_k.data(),
+                                     pool_s * sizeof(__half),
+                                     cudaMemcpyHostToDevice),
+                          "up pf sk");
+      w4::gpu::cuda_check(cudaMemcpy(sv_d, pc.s_v.data(),
+                                     pool_s * sizeof(__half),
+                                     cudaMemcpyHostToDevice),
+                          "up pf sv");
+      w4::gpu::cuda_check(cudaMemcpy(q_d, q.data(),
+                                     (size_t)H * D * sizeof(__half),
+                                     cudaMemcpyHostToDevice),
+                          "up pf q");
+      w4::gpu::cuda_check(cudaMemcpy(btB_d, btB.data(),
+                                     npages * sizeof(int),
+                                     cudaMemcpyHostToDevice),
+                          "up pf btB");
+      w4::gpu::cuda_check(cudaMemcpy(btA_d, btA.data(), na * sizeof(int),
+                                     cudaMemcpyHostToDevice),
+                          "up pf btA");
+
+      const w4::gpu::DeviceKVW4 pool{H,    S2,    D, gs, ccB.G,
+                                     sym ? 1 : 0,  qk_d,  sk_d, zk_d,
+                                     qv_d,  sv_d,  zv_d};
+      // B decodes from the pool.
+      w4::gpu::attention_w4_flash_paged(pool, btB_d, page, npages, q_d, o_d);
+      w4::gpu::cuda_check(cudaDeviceSynchronize(), "pf B sync");
+      std::vector<__half> oB((size_t)H * D);
+      w4::gpu::cuda_check(cudaMemcpy(oB.data(), o_d,
+                                     (size_t)H * D * sizeof(__half),
+                                     cudaMemcpyDeviceToHost),
+                          "down pf B");
+      // Contiguous B reference through the FP64 host reference.
+      const auto refB = w4::kv::attention_reference(q, ccB);
+      double numB = 0.0, denB = 0.0;
+      for (size_t j = 0; j < oB.size(); ++j) {
+        const double d = (double)__half2float(oB[j]) - refB[j];
+        numB += d * d;
+        denB += refB[j] * refB[j];
+      }
+      const double relB = std::sqrt(numB / (denB > 0.0 ? denB : 1.0));
+      ++checks;
+      if (relB > 1e-3) {
+        ++fails;
+        std::printf("FAIL prefix B oracle %s rel=%.3e\n", sym ? "sym" : "asym",
+                    relB);
+      }
+      // A decodes from the same pool via the prefix table.
+      w4::gpu::DeviceKVW4 poolA = pool;
+      poolA.S = S1;
+      w4::gpu::attention_w4_flash_paged(poolA, btA_d, page, npages, q_d, o_d);
+      w4::gpu::cuda_check(cudaDeviceSynchronize(), "pf A sync");
+      std::vector<__half> oA((size_t)H * D);
+      w4::gpu::cuda_check(cudaMemcpy(oA.data(), o_d,
+                                     (size_t)H * D * sizeof(__half),
+                                     cudaMemcpyDeviceToHost),
+                          "down pf A");
+      const auto refA = w4::kv::attention_reference(q, ccA);
+      double numA = 0.0, denA = 0.0;
+      for (size_t j = 0; j < oA.size(); ++j) {
+        const double d = (double)__half2float(oA[j]) - refA[j];
+        numA += d * d;
+        denA += refA[j] * refA[j];
+      }
+      const double relA = std::sqrt(numA / (denA > 0.0 ? denA : 1.0));
+      ++checks;
+      if (relA > 1e-3) {
+        ++fails;
+        std::printf("FAIL prefix A oracle %s rel=%.3e\n", sym ? "sym" : "asym",
+                    relA);
+      }
+      // The share is structural: the pool holds B's ceil(S2/page) pages and
+      // A added none — its 200 positions are read out of B's prefix pages.
+
+      cudaFree(qk_d);
+      cudaFree(qv_d);
+      cudaFree(zk_d);
+      cudaFree(zv_d);
+      cudaFree(sk_d);
+      cudaFree(sv_d);
+      cudaFree(q_d);
+      cudaFree(o_d);
+      cudaFree(btB_d);
+      cudaFree(btA_d);
+    }
+  }
+
   cublasDestroy(cb);
 
   // Host-side entry contracts: every malformed launch must throw before any
@@ -1309,6 +1699,53 @@ int main() {
     expect(throws_invalid(
                [&] { w4::gpu::dequant_f8((const uint8_t*)1, (const __half*)1, out, 4, 8, 7); }),
            "f8 dequant gs=7");
+    // Paged flash entry contracts.
+    {
+      const w4::gpu::DeviceKVW4 pk{1, 4, 8, 8, 1, 1, (const uint32_t*)1,
+                                   (const __half*)1, nullptr,
+                                   (const uint32_t*)1, (const __half*)1,
+                                   nullptr};
+      const int* btp = (const int*)1;
+      expect(throws_invalid([&] {
+               w4::gpu::attention_w4_flash_paged(pk, nullptr, 16, 1, out, out);
+             }),
+             "paged bt null");
+      expect(throws_invalid([&] {
+               w4::gpu::attention_w4_flash_paged(pk, btp, 0, 1, out, out);
+             }),
+             "paged page=0");
+      expect(throws_invalid([&] {
+               w4::gpu::attention_w4_flash_paged(pk, btp, 16, 0, out, out);
+             }),
+             "paged npages=0");
+      {
+        auto big_s = pk;
+        big_s.S = 100;
+        expect(throws_invalid([&] {
+                 w4::gpu::attention_w4_flash_paged(big_s, btp, 16, 1, out,
+                                                   out);
+               }),
+               "paged pool smaller than S");
+      }
+      {
+        auto big_d = pk;
+        big_d.D = 513;
+        expect(throws_invalid([&] {
+                 w4::gpu::attention_w4_flash_paged(big_d, btp, 16, 33, out,
+                                                   out);
+               }),
+               "paged D=513");
+      }
+      {
+        auto big_t = pk;
+        big_t.S = 65535 * 256 + 1;
+        expect(throws_invalid([&] {
+                 w4::gpu::attention_w4_flash_paged(big_t, btp, 16,
+                                                   65535 * 16 + 1, out, out);
+               }),
+               "paged S past tile-grid bound");
+      }
+    }
     expect(throws_invalid(
                [&] { w4::gpu::attention_fp16(nullptr, out, out, out, 1, 4, 8); }),
            "kv fp16 q null");

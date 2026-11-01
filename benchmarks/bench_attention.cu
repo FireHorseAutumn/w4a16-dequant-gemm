@@ -23,6 +23,7 @@
 
 #include "w4/kvattention.cuh"
 #include "w4/kvflash.cuh"
+#include "w4/kvpaged.hpp"
 
 namespace {
 
@@ -95,7 +96,7 @@ struct Case {
 struct Result {
   Case c;
   std::vector<double> fp16_ms, w4_ms, twopass_ms, flash16_ms, flashw4_ms,
-      flashf8_ms;
+      flashf8_ms, pagedw4_ms;
   bool hooks_bitwise;
   double vs_reference_rel;
   double quant_rel_w4, quant_rel_f8;
@@ -162,6 +163,46 @@ Result run_case(const Case& c, int reps, uint64_t seed) {
                       qk_d, sk_d, nullptr, qv_d, sv_d, nullptr};
   const DeviceKVF8 dp8{c.H, c.S, c.D, c.gs, cc8.G, qk8_d, sk8_d,
                        qv8_d, sv8_d};
+
+  // Paged pool: page 16, shuffled placement (the worst case for the
+  // indirection). Reuses the q_k/q_v etc. buffers — the pool is the same
+  // byte count as the contiguous cache here (npages*page >= S rounds up
+  // slightly), so fresh allocations sized to the pool.
+  const int page = 16;
+  const int npages = (c.S + page - 1) / page;
+  std::vector<int> bt(npages);
+  std::iota(bt.begin(), bt.end(), 0);
+  std::mt19937_64 shuf(seed ^ 0x9A6EULL);
+  std::shuffle(bt.begin(), bt.end(), shuf);
+  const auto pc = kv::paged_from_contiguous(cc, page, bt);
+  uint32_t *pqk_d, *pqv_d;
+  __half* psk_d;
+  __half* psv_d;
+  int* bt_d;
+  const size_t pool_q = (size_t)c.H * npages * page * wd;
+  const size_t pool_s = (size_t)c.H * npages * page * cc.G;
+  cuda_check(cudaMalloc(&pqk_d, pool_q * sizeof(uint32_t)), "pqk");
+  cuda_check(cudaMalloc(&pqv_d, pool_q * sizeof(uint32_t)), "pqv");
+  cuda_check(cudaMalloc(&psk_d, pool_s * sizeof(__half)), "psk");
+  cuda_check(cudaMalloc(&psv_d, pool_s * sizeof(__half)), "psv");
+  cuda_check(cudaMalloc(&bt_d, npages * sizeof(int)), "bt");
+  cuda_check(cudaMemcpy(pqk_d, pc.q_k.data(), pool_q * sizeof(uint32_t),
+                        cudaMemcpyHostToDevice),
+             "up pqk");
+  cuda_check(cudaMemcpy(pqv_d, pc.q_v.data(), pool_q * sizeof(uint32_t),
+                        cudaMemcpyHostToDevice),
+             "up pqv");
+  cuda_check(cudaMemcpy(psk_d, pc.s_k.data(), pool_s * sizeof(__half),
+                        cudaMemcpyHostToDevice),
+             "up psk");
+  cuda_check(cudaMemcpy(psv_d, pc.s_v.data(), pool_s * sizeof(__half),
+                        cudaMemcpyHostToDevice),
+             "up psv");
+  cuda_check(cudaMemcpy(bt_d, bt.data(), npages * sizeof(int),
+                        cudaMemcpyHostToDevice),
+             "up bt");
+  const DeviceKVW4 dpp{c.H,  c.S,   c.D,   c.gs, cc.G, 1,
+                       pqk_d, psk_d, nullptr, pqv_d, psv_d, nullptr};
 
   // Bitwise hook check plus one agreement figure vs the host reference.
   // The W4 flash path runs the hooks everywhere; the single-block path
@@ -303,6 +344,9 @@ Result run_case(const Case& c, int reps, uint64_t seed) {
     attention_f8_flash(dp8, q_d, o_d);
     cuda_check(cudaDeviceSynchronize(), "f8 flash sync");
     const auto t6 = std::chrono::steady_clock::now();
+    attention_w4_flash_paged(dpp, bt_d, page, npages, q_d, o_d);
+    cuda_check(cudaDeviceSynchronize(), "paged w4 sync");
+    const auto t7 = std::chrono::steady_clock::now();
     if (rep < 0) continue;
     if (old_ok) {
       r.fp16_ms.push_back(
@@ -318,6 +362,8 @@ Result run_case(const Case& c, int reps, uint64_t seed) {
         std::chrono::duration<double, std::milli>(t5 - t4).count());
     r.flashf8_ms.push_back(
         std::chrono::duration<double, std::milli>(t6 - t5).count());
+    r.pagedw4_ms.push_back(
+        std::chrono::duration<double, std::milli>(t7 - t6).count());
   }
 
   cudaFree(qk_d);
@@ -328,6 +374,11 @@ Result run_case(const Case& c, int reps, uint64_t seed) {
   cudaFree(sv_d);
   cudaFree(sk8_d);
   cudaFree(sv8_d);
+  cudaFree(pqk_d);
+  cudaFree(pqv_d);
+  cudaFree(psk_d);
+  cudaFree(psv_d);
+  cudaFree(bt_d);
   cudaFree(q_d);
   cudaFree(o_d);
   cudaFree(k16_d);
@@ -447,6 +498,7 @@ int main(int argc, char** argv) {
     const double f16_med = median(r.flash16_ms);
     const double fw4_med = median(r.flashw4_ms);
     const double ff8_med = median(r.flashf8_ms);
+    const double pw4_med = median(r.pagedw4_ms);
     if (old_ok) {
       const double fp16_med = median(r.fp16_ms);
       const double w4_med = median(r.w4_ms);
@@ -503,14 +555,18 @@ int main(int argc, char** argv) {
     print_ms_array(f, r.flashw4_ms);
     std::fprintf(f, ",\n     \"flashf8_wall_ms\": ");
     print_ms_array(f, r.flashf8_ms);
+    std::fprintf(f, ",\n     \"pagedw4_wall_ms\": ");
+    print_ms_array(f, r.pagedw4_ms);
     std::fprintf(f,
                  ",\n     \"flash16_median_ms\": %.4f, \"flashw4_median_ms\": "
-                 "%.4f, \"flashf8_median_ms\": %.4f,\n",
-                 f16_med, fw4_med, ff8_med);
+                 "%.4f, \"flashf8_median_ms\": %.4f, \"pagedw4_median_ms\": "
+                 "%.4f,\n",
+                 f16_med, fw4_med, ff8_med, pw4_med);
     std::fprintf(f,
                  "     \"ratio_flashw4_vs_flash16\": %.3f, "
-                 "\"ratio_flashf8_vs_flash16\": %.3f,\n",
-                 f16_med / fw4_med, f16_med / ff8_med);
+                 "\"ratio_flashf8_vs_flash16\": %.3f, "
+                 "\"ratio_pagedw4_vs_flashw4\": %.3f,\n",
+                 f16_med / fw4_med, f16_med / ff8_med, fw4_med / pw4_med);
     std::fprintf(f,
                  "     \"quant_rel_l2_w4\": %.4e, \"quant_rel_l2_f8\": %.4e,\n",
                  r.quant_rel_w4, r.quant_rel_f8);

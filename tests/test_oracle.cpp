@@ -11,6 +11,7 @@
 
 #include "w4/kvcache.hpp"
 #include "w4/kvfp8.hpp"
+#include "w4/kvpaged.hpp"
 #include "w4/mx.hpp"
 #include "w4/pack.hpp"
 
@@ -602,6 +603,75 @@ int main() {
              }),
              "f8 q size");
     }
+  }
+
+  // ---- Paged W4 cache host gates (R7) ----
+  // The scatter builder: a shuffled block table must place each logical
+  // row so that bt-resolution recovers the contiguous cache exactly, and
+  // the validators must reject malformed geometry.
+  {
+    const std::vector<double> k = w4::normal_weights(2 * 37 * 24, 0x7A11);
+    const std::vector<double> v = w4::normal_weights(2 * 37 * 24, 0x7A12);
+    const auto cc = w4::kv::quantize_cache(k, v, 2, 37, 24, 8, true);
+    const int page = 16, npages = 3;  // ceil(37/16), ragged tail
+    std::vector<int> bt = {2, 0, 1};  // shuffled
+    const auto pc = w4::kv::paged_from_contiguous(cc, page, bt);
+    w4::kv::validate_paged(pc);
+    const int wd = w4::words(24);
+    bool bad = false;
+    for (int h = 0; h < 2 && !bad; ++h)
+      for (int t = 0; t < 37 && !bad; ++t) {
+        const int row = bt[t / page] * page + (t % page);
+        const size_t pq = ((size_t)h * npages * page + row) * wd;
+        const size_t cq = ((size_t)h * 37 + t) * wd;
+        if (std::memcmp(&pc.q_k[pq], &cc.q_k[cq], wd * sizeof(uint32_t)) != 0)
+          bad = true;
+        const size_t ps = ((size_t)h * npages * page + row) * cc.G;
+        const size_t cs = ((size_t)h * 37 + t) * cc.G;
+        if (std::memcmp(&pc.s_v[ps], &cc.s_v[cs], cc.G * sizeof(__half)) != 0)
+          bad = true;
+      }
+    ++checks;
+    if (bad) {
+      ++fails;
+      std::printf("FAIL paged scatter: bt-resolved row != contiguous row\n");
+    }
+
+    auto throws_invalid = [](auto&& f) {
+      try {
+        f();
+      } catch (const std::invalid_argument&) {
+        return true;
+      } catch (...) {
+      }
+      return false;
+    };
+    auto expect = [&](bool ok, const char* name) {
+      ++checks;
+      if (!ok) {
+        ++fails;
+        std::printf("FAIL paged no-throw: %s\n", name);
+      }
+    };
+    expect(throws_invalid(
+               [&] { w4::kv::paged_from_contiguous(cc, 0, bt); }),
+           "paged page=0");
+    expect(throws_invalid([&] {
+             w4::kv::paged_from_contiguous(cc, 16, std::vector<int>{0, 1});
+           }),
+           "paged short table");
+    expect(throws_invalid([&] {
+             w4::kv::paged_from_contiguous(cc, 16, std::vector<int>{0, 1, 1});
+           }),
+           "paged repeated page");
+    expect(throws_invalid([&] {
+             w4::kv::paged_from_contiguous(cc, 16, std::vector<int>{0, 1, 9});
+           }),
+           "paged entry out of pool");
+    auto badpool = pc;
+    badpool.q_k.resize(3);
+    expect(throws_invalid([&] { w4::kv::validate_paged(badpool); }),
+           "paged q size");
   }
 
   std::printf("oracle: %d checks, %d failures\n", checks, fails);
