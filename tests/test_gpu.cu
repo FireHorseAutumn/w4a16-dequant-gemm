@@ -1652,8 +1652,9 @@ int main() {
            }),
            "kv fp16 flash q null");
     // FP8 flash entry contracts: dims, D bounds (shared stage and word
-    // alignment), gs, G, nulls, the tile-grid S bound, dequant_f8 rules.
-    const w4::gpu::DeviceKVF8 good_f8{1, 4, 8, 8, 2, (const uint8_t*)1,
+    // alignment), gs, G, nulls, the tile-grid S bound, base alignment of
+    // the word-walked caches, dequant_f8 rules.
+    const w4::gpu::DeviceKVF8 good_f8{1, 4, 8, 8, 1, (const uint8_t*)1,
                                       (const __half*)1, (const uint8_t*)1,
                                       (const __half*)1};
     auto f8_s0 = good_f8; f8_s0.S = 0;
@@ -1699,6 +1700,15 @@ int main() {
     expect(throws_invalid(
                [&] { w4::gpu::dequant_f8((const uint8_t*)1, (const __half*)1, out, 4, 8, 7); }),
            "f8 dequant gs=7");
+    // The word walk casts byte pointers to uint32: bases must be 4 B
+    // aligned, rejected pre-launch (a misaligned base is an async device
+    // fault otherwise).
+    expect(throws_invalid(
+               [&] { w4::gpu::dequant_f8((const uint8_t*)3, (const __half*)4, out, 4, 8, 8); }),
+           "f8 dequant q misaligned");
+    expect(throws_invalid(
+               [&] { w4::gpu::attention_f8_flash(good_f8, out, out); }),
+           "f8 flash cache base alignment");
     // Paged flash entry contracts.
     {
       const w4::gpu::DeviceKVW4 pk{1, 4, 8, 8, 1, 1, (const uint32_t*)1,
@@ -1745,6 +1755,13 @@ int main() {
                }),
                "paged S past tile-grid bound");
       }
+      // npages*page passes the size_t geometry check but overflows the
+      // 32-bit pool_rows the kernel receives (50000^2 = 2.5e9 > 2^31).
+      expect(throws_invalid([&] {
+               w4::gpu::attention_w4_flash_paged(pk, btp, 50000, 50000, out,
+                                                 out);
+             }),
+             "paged pool rows overflow");
     }
     expect(throws_invalid(
                [&] { w4::gpu::attention_fp16(nullptr, out, out, out, 1, 4, 8); }),

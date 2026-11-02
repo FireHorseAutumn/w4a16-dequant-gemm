@@ -56,8 +56,10 @@ inline float* x_scratch(size_t n) {
   static float* buf = nullptr;
   static size_t cap = 0;
   if (n > cap) {
+    float* nb = nullptr;
+    cuda_check(cudaMalloc(&nb, n * sizeof(float)), "x scratch");
     if (buf) cudaFree(buf);
-    cuda_check(cudaMalloc(&buf, n * sizeof(float)), "x scratch");
+    buf = nb;
     cap = n;
   }
   return buf;

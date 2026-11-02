@@ -1,11 +1,13 @@
 # W4A16 Fused Dequant GEMM
 
-**STATUS: R5 complete — KV-cache-quantized decode attention landed and
-gated (W4 cache, dequant at load in both K and V phases). Wins the
-two-pass everywhere (1.4–4.3x); vs an FP16-cache fused baseline it loses
-at small caches and wins once the FP16 cache spills L2 (1.12x at 64 MB) —
-the output phase is instruction-bound before it is byte-bound. R4 (MXFP4)
-complete before it. Governor-pinned numbers.**
+**STATUS: R7 complete — split-S flash decode attention (S past the old
+single-block 4096 bound), FP8 (E4M3) KV cache, and paged W4 with prefix
+sharing landed and gated on top of the R5 KV rung. Flash FP16 runs at
+triad at large S and beats the single-block baseline everywhere (up to
+10.4x at H=8); flash W4 ties it from the L2 spill up — the win is a 4x
+smaller cache, not wall time, dequant at load being instruction-bound.
+FP8 KV's footing is accuracy (rel L2 2.6e-2 vs W4's 1.2e-1), not speed.
+R4 (MXFP4) and the R1–R3 GEMM rungs below. Governor-pinned numbers.**
 
 ## The kernel
 
@@ -187,9 +189,10 @@ MMA M=64.
   (per-head dequant + FP16 attention) at 2e-3. Configs cover S=1, ragged
   words (D=96), both sign modes, and S=4096 exactly on the bound. CTest
   2/2, 350 checks, zero warnings.
-- `benchmarks/bench_attention.cu` — FP16 fused vs W4 fused vs two-pass,
-  same session, MHA (H=32) and GQA (H=8) head counts; raw reps + metadata
-  in `data/w4a16_kv_bench.json`.
+- `benchmarks/bench_attention.cu` — single-block FP16/W4 fused vs
+  two-pass, plus the split-S flash paths (FP16, W4, FP8, paged W4), same
+  session, MHA (H=32) and GQA (H=8) head counts with S past the
+  single-block bound; raw reps + metadata in `data/w4a16_kv_bench.json`.
 
 ## R5 numbers (2026-11-01 pinned rerun, RTX 5060 Laptop, performance governor)
 
@@ -217,6 +220,89 @@ extension — the quantization argument that actually holds for long-context
 decode. The named lever for the small-cache loss is a chunk-staged
 shared-memory V pass (dequant a position tile once, not per output
 element); recorded, not done.
+
+(2026-11-02: the flash-rungs rerun re-measured these paths in session —
+four of six cells reproduce this table exactly; the two L2-boundary cells
+moved with the FP16 cache's residency regime: 32/2048 0.59x -> 1.11x
+(219.7 -> 117.9 GB/s on the 33.5 MB cache) and 8/4096 0.89x -> 0.77x,
+with the 8/4096 two-pass ratio moving 1.41x -> 0.91x on the same flip.
+The conclusion — W4 wins once the FP16 cache spills L2 — is unchanged.
+This table keeps its 2026-11-01 values; the JSON now holds the 11-02 run,
+and the 11-01 values live in git history.)
+
+## R5.5 + R6 + R7 contents (2026-11-01)
+
+- `include/w4/kvflash.cuh` — split-S ("flash-decoding") decode attention.
+  The S <= 4096 bound of `kvattention.cuh` was the static scores array,
+  not a law: phase 1 (one block per (head, 256-position tile)) computes
+  the tile max, tile sum, and weighted V accumulation into a cached
+  partials scratch; phase 2 (one block per head) rescales and combines.
+  Nothing per-S lives in shared memory, so S is bounded only by the tile
+  grid (65535 tiles) — and since the grid is H x tiles, the H=8 occupancy
+  hole of one-block-per-head is gone with it. Three cache variants:
+  `attention_w4_flash` (the R5 dequant-at-load walk, unchanged),
+  `attention_fp16_flash` (same structure over an FP16 cache),
+  `attention_f8_flash` (R6 below). The `k_out`/`v_out` hooks still
+  reproduce the per-head dequant bitwise — every position is touched
+  exactly once.
+- `include/w4/kvfp8.hpp` + `dequant_f8`/`flash_f8_phase1` — FP8 (E4M3) KV
+  cache: one byte per element, one FP16 scale per (position, group) on
+  the W4 group machinery. Quantizer s = amax/448, no saturation (the MX
+  rung's ethos); branch-free exact decode (the R4 LUT lesson: no
+  function-local tables on device). NaN encodings are never emitted by
+  the quantizer and decode as +/-480 if they appear — documented, not
+  handled.
+- `include/w4/kvpaged.hpp` + `attention_w4_flash_paged` — paged W4: a
+  per-head pool of npages x page positions plus a block table. Paging
+  changes where a position lives, never what it contains; tiles partition
+  the logical range, hooks write in logical order and stay bitwise, and
+  the prefix-sharing exhibit decodes two sequences (one a prefix of the
+  other) out of a single pool.
+- Gates: hooks bitwise vs `dequant_head`/`dequant_head_f8` at every
+  config, including S past the old bound; output vs the FP64 references
+  at rel L2 <= 1e-3; flash vs single-block at 2e-3; paged bitwise vs
+  contiguous flash on the same logical cache; entry-throw contracts
+  (dims, D shared bound, gs/G, nulls, zeros discipline, the tile-grid S
+  bound, FP8 word/base alignment, paged pool geometry and its 2^31 row
+  bound). CTest 2/2 = 493 device + 212922 host checks, zero warnings.
+
+## R5.5–R7 numbers (2026-11-02 pinned rerun, RTX 5060 Laptop, performance governor + platform profile)
+
+Same-session triad 342.0 GB/s (the 2026-11-01 runs sat at ~320 — quote
+the triad per session). Ten decode-class cases, raw reps + metadata in
+`data/w4a16_kv_bench.json` (this run superseded the R5-era JSON).
+
+Split-S flash16 vs the single-block FP16 kernel: wins everywhere,
+1.5x–10.4x on the shared cases (2.6x at H=32/S=4096, 10.4x at H=8/S=4096
+— the occupancy fix is the whole story at H=8), and runs at 290–350 GB/s
+effective at large S — at triad.
+
+flashw4 vs flash16 (same kernel structure, so the comparison isolates
+cache bytes):
+
+| H | S=512 | S=2048 | S=4096 | S=8192 | S=32768 |
+|---|---|---|---|---|---|
+| 32 | 0.74x | 0.58x | 1.01x | 1.00x | 1.02x |
+| 8 | 0.83x | 0.74x | 0.63x | 0.97x | 0.99x |
+
+Same direction as R5, sharper: the W4 cache wins nothing in wall time —
+parity from the L2 spill up, losses below it. At H=32/S=32768 flashw4
+moves a quarter of flash16's bytes and still ties (92 vs 350 GB/s
+effective): dequant at load is instruction-bound, not byte-bound, at
+every size measured. The win that exists is cache-residency extension —
+a 4x smaller cache — and past S=4096 the flash path is the only path.
+
+flashf8 vs flash16: 0.19–0.41x at every size — the E4M3 decode is
+pricier and one uint32 covers only four elements (twice the score-walk
+word iterations of W4); even at 134 MB, deep in DRAM, it runs 62 GB/s
+effective. FP8 KV's footing on this data is accuracy: rel L2 2.57e-2 vs
+W4's 1.17e-1 — 4.6x closer for 2x the bytes. W4 wins bytes, FP8 wins
+accuracy, neither wins wall time against FP16 at decode shapes; that
+trade is now measured, not asserted.
+
+Paged vs contiguous flashw4 at page=16: 0.51–0.66x — the block-table
+indirection costs a third to a half at small pages; the page-size sweep
+is the recorded lever.
 
 ## R2 contents (2026-10-31)
 
@@ -288,9 +374,11 @@ dequant, read W in the GEMM) that a fused kernel eliminates entirely.
 
 ## Stretch
 
-- FP8 block-scaled variants; emulated formats on hardware without native
-  FP4; flash-style online softmax over cache tiles past S=4096; the
-  chunk-staged V pass named in the R5 numbers.
+- Emulated formats beyond the two landed (MXFP4 GEMM, E4M3 KV); the
+  chunk-staged V pass named in the R5 numbers; the double-buffered MMA
+  pipeline and the SIMT/MMA dispatcher; the paged page-size sweep; the
+  equal-bytes experiment the flash path now reaches — W4 at 4x the
+  context length for the FP16 cache's bytes, at the same latency class.
 
 ## Ceiling honesty
 

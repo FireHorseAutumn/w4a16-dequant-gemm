@@ -72,8 +72,8 @@ inline void validate_paged(const KVCacheW4Paged& c) {
 inline KVCacheW4Paged paged_from_contiguous(const KVCacheW4& c, int page,
                                             const std::vector<int>& bt) {
   validate_cache(c);
-  const size_t lpages = (size_t)(c.S + page - 1) / page;
   if (page < 1) throw std::invalid_argument("paged_from: bad page size");
+  const size_t lpages = ((size_t)c.S + (size_t)page - 1) / (size_t)page;
   if (bt.size() != lpages)
     throw std::invalid_argument("paged_from: block table size");
   std::vector<char> seen(bt.size(), 0);

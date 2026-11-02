@@ -59,8 +59,10 @@ inline float* kv_part_scratch(size_t nfloats) {
   static float* buf = nullptr;
   static size_t cap = 0;
   if (nfloats > cap) {
+    float* nb = nullptr;
+    cuda_check(cudaMalloc(&nb, nfloats * sizeof(float)), "kv part scratch");
     if (buf) cudaFree(buf);
-    cuda_check(cudaMalloc(&buf, nfloats * sizeof(float)), "kv part scratch");
+    buf = nb;
     cap = nfloats;
   }
   return buf;
@@ -446,6 +448,8 @@ inline void dequant_f8(const uint8_t* q, const __half* s, __half* w, int S,
   // misalign row starts, so reject it here.
   if (D % 4 != 0)
     throw std::invalid_argument("f8 dequant: D must be a multiple of 4");
+  if ((uintptr_t)q % 4 != 0)
+    throw std::invalid_argument("f8 dequant: q must be 4-byte aligned");
   const int block = 256;
   dequant_kernel_f8<<<(unsigned)((total + block - 1) / block), block, 0,
                       stream>>>(q, s, w, S, D, gs);
@@ -574,6 +578,8 @@ inline void attention_f8_flash(const DeviceKVF8& p, const __half* q,
   // The 4-byte word walk requires 4 B-aligned row starts.
   if (p.D % 4 != 0)
     throw std::invalid_argument("kv f8 flash: D must be a multiple of 4");
+  if ((uintptr_t)p.q_k % 4 != 0 || (uintptr_t)p.q_v % 4 != 0)
+    throw std::invalid_argument("kv f8 flash: cache bases 4-byte aligned");
   const int T = (p.S + FLASH_TILE - 1) / FLASH_TILE;
   float* part = kv_part_scratch((size_t)p.H * T * (p.D + 2));
   const dim3 grid((unsigned)p.H, (unsigned)T);
@@ -740,6 +746,9 @@ inline void attention_w4_flash_paged(const DeviceKVW4& p, const int* bt,
     throw std::invalid_argument("kv paged flash: symmetric carries zeros");
   if (page < 1 || npages < 1 || (size_t)npages * page < (size_t)p.S)
     throw std::invalid_argument("kv paged flash: bad page geometry");
+  // pool_rows and the in-kernel row arithmetic are 32-bit.
+  if ((int64_t)npages * page >= (int64_t{1} << 31))
+    throw std::invalid_argument("kv paged flash: pool rows exceed 2^31");
   if (p.S > 65535 * FLASH_TILE)
     throw std::invalid_argument("kv paged flash: S exceeds tile-grid bound");
   if (!q || !out) throw std::invalid_argument("kv paged flash: null io");

@@ -213,10 +213,13 @@ Result run_case(const Case& c, int reps, uint64_t seed) {
   bool hooks = true;
   const int nvar = old_ok ? 3 : 2;
   for (int variant = 0; variant < nvar; ++variant) {
+    // In bounds: single-block W4, flash W4, flash FP8. Past the bound:
+    // flash W4, flash FP8 (the single-block path rejects by contract).
+    const bool is_f8 = old_ok ? (variant == 2) : (variant == 1);
     if (variant == 0 && old_ok) {
       attention_w4(dp, q_d, o_d, 0, ko_d, vo_d);
       cuda_check(cudaDeviceSynchronize(), "hooks sync");
-    } else if (variant <= 1) {
+    } else if (!is_f8) {
       attention_w4_flash(dp, q_d, o_d, 0, ko_d, vo_d);
       cuda_check(cudaDeviceSynchronize(), "flash hooks sync");
     } else {
@@ -224,10 +227,10 @@ Result run_case(const Case& c, int reps, uint64_t seed) {
       cuda_check(cudaDeviceSynchronize(), "f8 hooks sync");
     }
     for (int h = 0; h < c.H; ++h) {
-      const auto kref = variant == 2 ? kv8::dequant_head_f8(cc8, h, false)
-                                     : kv::dequant_head(cc, h, false);
-      const auto vref = variant == 2 ? kv8::dequant_head_f8(cc8, h, true)
-                                     : kv::dequant_head(cc, h, true);
+      const auto kref = is_f8 ? kv8::dequant_head_f8(cc8, h, false)
+                              : kv::dequant_head(cc, h, false);
+      const auto vref = is_f8 ? kv8::dequant_head_f8(cc8, h, true)
+                              : kv::dequant_head(cc, h, true);
       cuda_check(cudaMemcpy(buf.data(), ko_d + (size_t)h * c.S * c.D,
                             (size_t)c.S * c.D * sizeof(__half),
                             cudaMemcpyDeviceToHost),
@@ -266,11 +269,13 @@ Result run_case(const Case& c, int reps, uint64_t seed) {
     }
   }
   // The reference figure is the single-block W4 output vs the host
-  // reference where that path is in bounds, the flash output past it (the
-  // hooks loop left the flash output in o_d for the large-S cases).
+  // reference where that path is in bounds, the flash W4 output past it.
   if (old_ok) {
     attention_w4(dp, q_d, o_d);
     cuda_check(cudaDeviceSynchronize(), "w4 rel sync");
+  } else {
+    attention_w4_flash(dp, q_d, o_d);
+    cuda_check(cudaDeviceSynchronize(), "flash rel sync");
   }
   std::vector<__half> o_gpu((size_t)c.H * c.D);
   cuda_check(cudaMemcpy(o_gpu.data(), o_d, (size_t)c.H * c.D * sizeof(__half),
