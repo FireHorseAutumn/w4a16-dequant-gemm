@@ -152,16 +152,24 @@ baseline; triad 320.6 GB/s. MMA ratios vs baseline:
 | 64 | 1.40x | 1.79x |
 
 Flat across M and far under triad (35–45 GB/s effective) — the signature
-of a staging-latency-bound kernel: the chunk loop is single-buffered, two
-`__syncthreads` per chunk, no overlap. The M=64 SIMT loss is gone
-(0.44x -> 1.79x at N=14336), which was the R3 charter; the margin
-headroom is double-buffering (cp.async / register prefetch), recorded as
-the next lever. Tile-shape A/Bs were run and rejected (chunk 64 doubles
-the x-staging footprint; N-tile 32 halves W work per chunk while x
-staging stays fixed). The same run re-measured the SIMT fused path — the
-R2 table above is this session — reproducing the 2026-10-31 pinned
-numbers to a few hundredths. Best-of-dispatch vs baseline: SIMT M <= 16,
-MMA M=64.
+of a staging-latency-bound kernel. The M=64 SIMT loss is gone
+(0.44x -> 1.79x at N=14336), which was the R3 charter. Tile-shape A/Bs
+were run and rejected (chunk 64 doubles the x-staging footprint; N-tile
+32 halves W work per chunk while x staging stays fixed). The same run
+re-measured the SIMT fused path — the R2 table above is this session —
+reproducing the 2026-10-31 pinned numbers to a few hundredths.
+Best-of-dispatch vs baseline: SIMT M <= 16, MMA M=64.
+
+R3.5 (2026-11-03, separate commit): the chunk loop is now double-buffered
+— the next chunk's packed word, scale/zero, and x slivers prefetch into
+registers under the current chunk's MMA, ws/xs alternate two shared
+buffers, one `__syncthreads` per chunk instead of two. Numerics
+unchanged; CTest 2/2. The table above stays the single-buffered pinned
+run of record: the replacement measured flat at N=4096 and +4–6% at
+N=14336 in an unpinned same-session A/B (triad 264–265 GB/s, a
+low-power-profile session), still 25–45 GB/s effective. Staging latency
+still binds; cp.async into shared is the next lever. The pinned rerun
+joins the next measurement pass.
 
 ## R5 contents (2026-10-31 — KV-cache decode attention)
 
@@ -375,9 +383,9 @@ dequant, read W in the GEMM) that a fused kernel eliminates entirely.
 ## Stretch
 
 - Emulated formats beyond the two landed (MXFP4 GEMM, E4M3 KV); the
-  chunk-staged V pass named in the R5 numbers; the double-buffered MMA
-  pipeline and the SIMT/MMA dispatcher; the paged page-size sweep; the
-  equal-bytes experiment the flash path now reaches — W4 at 4x the
+  chunk-staged V pass named in the R5 numbers; cp.async staging for the
+  MMA pipeline and the SIMT/MMA dispatcher; the paged page-size sweep;
+  the equal-bytes experiment the flash path now reaches — W4 at 4x the
   context length for the FP16 cache's bytes, at the same latency class.
 
 ## Ceiling honesty

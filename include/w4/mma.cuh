@@ -1,7 +1,7 @@
 #pragma once
 
 // Fused dequant + WMMA GEMM (R3). Same contract as the SIMT fused kernel —
-// packed weights dequantized via dequant_one, never materialized in DRAM —
+// packed weights dequantized via dequant_one, never materialize in DRAM —
 // but the multiply runs on tensor cores. The SIMT R2 kernel hits its wall at
 // M=64: N*M*K FP32 FMAs on CUDA cores, W re-read per m-tile, and x L2
 // traffic. Fragment MMA removes all three at once: the M=64 tile is one
@@ -16,13 +16,23 @@
 // chunk. Outputs are stored through a per-warp shared tile so edge
 // fragments never write out of bounds.
 //
-// The pipeline is single-buffered: staging and MMA alternate under two
-// __syncthreads per chunk with no overlap, so the kernel is staging-latency
-// bound, not bandwidth bound. Measured A/B (same session, unpinned): chunk
-// 64 and N-tile 32 both lose to this configuration — wider chunks amortize
-// syncs but double the x-staging footprint, and a narrower N tile halves W
-// work per chunk while x staging stays fixed. The next lever is
-// double-buffering (cp.async or register prefetch), not tile shape.
+// Double-buffered pipeline (R3.5): the next chunk's packed word, scale/zero,
+// and eight x slivers per thread are loaded into registers before the
+// current chunk's MMA phase, so the global-load latency overlaps the
+// tensor-core work instead of serializing with it. ws/xs alternate between
+// two shared buffers — staging writes one while the MMA reads the other —
+// and the loop carries one __syncthreads per chunk instead of two: the
+// barrier both retires the current buffer's fragment reads and publishes
+// the freshly staged other buffer. Numerics are unchanged: same dequant
+// values, same fragment and accumulation order. Measured A/B (same session,
+// unpinned): chunk 64 and N-tile 32 both lose to 64x64x32 — wider chunks
+// amortize syncs but double the x-staging footprint, and a narrower N tile
+// halves W work per chunk while x staging stays fixed. Same-session
+// unpinned A/B against the single-buffered build this replaced: flat at
+// N=4096, +4-6% at N=14336 — the kernel remains staging-latency bound at
+// 25-45 GB/s effective, so cp.async straight into shared stays the next
+// lever (drops the prefetch registers; W pays a shared round-trip for the
+// dequant).
 //
 // x stays FP16 and is read from global through the xs stage (L2-resident at
 // decode shapes) — the FP32 pre-pass of the SIMT kernel was only there to
@@ -47,8 +57,8 @@ __global__ void mma_kernel(const DevicePackedW p,
                            const __half* __restrict__ x,
                            __half* __restrict__ c, const int M,
                            __half* __restrict__ w_out) {
-  __shared__ __align__(32) __half ws[MMA_TILE_N][MMA_CHUNK_K];
-  __shared__ __align__(32) __half xs[MMA_TILE_M][MMA_CHUNK_K];
+  __shared__ __align__(32) __half ws[2][MMA_TILE_N][MMA_CHUNK_K];
+  __shared__ __align__(32) __half xs[2][MMA_TILE_M][MMA_CHUNK_K];
   __shared__ __align__(32) float cs[8][16][16];  // per-warp store staging
 
   const int n0 = blockIdx.x * MMA_TILE_N;
@@ -64,51 +74,83 @@ __global__ void mma_kernel(const DevicePackedW p,
   nvcuda::wmma::fill_fragment(acc[0], 0.0f);
   nvcuda::wmma::fill_fragment(acc[1], 0.0f);
 
-  for (int kc = 0; kc < p.K; kc += MMA_CHUNK_K) {
-    // W tile: one packed word per thread, 64 rows x 4 words.
-    {
-      const int nl = tid / 4;
-      const int w = kc / 8 + (tid % 4);
-      const int n = n0 + nl;
-      const int k0 = 8 * w;
-      if (n < p.N && w < wpr) {
-        const int g = k0 / p.gs;
-        const __half s = p.scales[(size_t)n * p.G + g];
-        const int z =
-            p.symmetric
+  const int nl = tid / 4;  // W row this thread stages
+  const int wq = tid % 4;  // its word lane within the chunk
+
+  // One chunk in flight: packed word + scale/zero for the W tile, eight x
+  // slivers. Guards match the staging stores exactly.
+  struct ChunkRegs {
+    uint32_t qw;
+    __half s;
+    int z;
+    bool valid;
+    __half xv[8];
+  };
+
+  auto load_chunk = [&](int kc, ChunkRegs& r) {
+    const int w = kc / 8 + wq;
+    const int n = n0 + nl;
+    r.valid = n < p.N && w < wpr;
+    if (r.valid) {
+      const int g = (8 * w) / p.gs;
+      r.s = p.scales[(size_t)n * p.G + g];
+      r.z = p.symmetric
                 ? 8
                 : (int)((p.zeros[(size_t)n * words(p.G) + g / 8] >>
                          (4 * (g % 8))) &
                         0xF);
-        const uint32_t qw = p.q[(size_t)n * wpr + w];
-#pragma unroll
-        for (int j = 0; j < 8; ++j) {
-          const int k = k0 + j;
-          const bool in = k < p.K;
-          const __half wj =
-              in ? dequant_one(s, (int)((qw >> (4 * j)) & 0xF), z)
-                 : __float2half_rn(0.0f);
-          ws[nl][(tid % 4) * 8 + j] = wj;
-          if (w_out && in) w_out[(size_t)n * p.K + k] = wj;
-        }
-      } else {
-#pragma unroll
-        for (int j = 0; j < 8; ++j)
-          ws[nl][(tid % 4) * 8 + j] = __float2half_rn(0.0f);
-      }
+      r.qw = p.q[(size_t)n * wpr + w];
     }
-    // x tile: 64x32 halves, zero-padded past M and K.
-    for (int t = tid; t < MMA_TILE_M * MMA_CHUNK_K; t += 256) {
-      const int ml = t / MMA_CHUNK_K, kl = t % MMA_CHUNK_K;
-      const int m = m0 + ml, k = kc + kl;
-      xs[ml][kl] = (m < M && k < p.K) ? x[(size_t)m * p.K + k]
-                                      : __float2half_rn(0.0f);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int t = tid + 256 * i;
+      const int m = m0 + (t >> 5), k = kc + (t & 31);
+      r.xv[i] = (m < M && k < p.K) ? x[(size_t)m * p.K + k]
+                                   : __float2half_rn(0.0f);
     }
-    __syncthreads();
+  };
 
-    // ws[n][k] read as a col_major B fragment: element (k, n) sits at
-    // k + n*CHUNK_K, so the fragment base for (k0', n0') is &ws[n0'][k0']
-    // with ldm CHUNK_K. xs is row-major A with ldm CHUNK_K.
+  auto store_chunk = [&](int kc, int b, const ChunkRegs& r) {
+    if (r.valid) {
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const int k = kc + wq * 8 + j;
+        const bool in = k < p.K;
+        const __half wj =
+            in ? dequant_one(r.s, (int)((r.qw >> (4 * j)) & 0xF), r.z)
+               : __float2half_rn(0.0f);
+        ws[b][nl][wq * 8 + j] = wj;
+        if (w_out && in) w_out[(size_t)(n0 + nl) * p.K + k] = wj;
+      }
+    } else {
+#pragma unroll
+      for (int j = 0; j < 8; ++j)
+        ws[b][nl][wq * 8 + j] = __float2half_rn(0.0f);
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int t = tid + 256 * i;
+      xs[b][t >> 5][t & 31] = r.xv[i];
+    }
+  };
+
+  // Prologue: chunk 0 into buffer 0.
+  ChunkRegs cr;
+  load_chunk(0, cr);
+  store_chunk(0, 0, cr);
+  __syncthreads();
+
+  int cur = 0;
+  for (int kc = 0; kc < p.K; kc += MMA_CHUNK_K) {
+    const int kn = kc + MMA_CHUNK_K;
+    const bool more = kn < p.K;
+    ChunkRegs nr;
+    if (more) load_chunk(kn, nr);
+
+    // MMA on buffer cur while the next chunk's loads are in flight.
+    // ws[b][n][k] read as a col_major B fragment: element (k, n) sits at
+    // k + n*CHUNK_K, so the fragment base for (k0', n0') is
+    // &ws[b][n0'][k0'] with ldm CHUNK_K. xs is row-major A, ldm CHUNK_K.
 #pragma unroll
     for (int kf = 0; kf < MMA_CHUNK_K / 16; ++kf) {
       nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, __half,
@@ -117,15 +159,19 @@ __global__ void mma_kernel(const DevicePackedW p,
       nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, __half,
                              nvcuda::wmma::col_major>
           bf;
-      nvcuda::wmma::load_matrix_sync(af[0], &xs[mf * 16][kf * 16],
+      nvcuda::wmma::load_matrix_sync(af[0], &xs[cur][mf * 16][kf * 16],
                                      MMA_CHUNK_K);
-      nvcuda::wmma::load_matrix_sync(af[1], &xs[(mf + 1) * 16][kf * 16],
+      nvcuda::wmma::load_matrix_sync(af[1], &xs[cur][(mf + 1) * 16][kf * 16],
                                      MMA_CHUNK_K);
-      nvcuda::wmma::load_matrix_sync(bf, &ws[nf * 16][kf * 16], MMA_CHUNK_K);
+      nvcuda::wmma::load_matrix_sync(bf, &ws[cur][nf * 16][kf * 16],
+                                     MMA_CHUNK_K);
       nvcuda::wmma::mma_sync(acc[0], af[0], bf, acc[0]);
       nvcuda::wmma::mma_sync(acc[1], af[1], bf, acc[1]);
     }
+
+    if (more) store_chunk(kn, cur ^ 1, nr);
     __syncthreads();
+    cur ^= 1;
   }
 
 #pragma unroll
