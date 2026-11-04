@@ -171,6 +171,29 @@ low-power-profile session), still 25–45 GB/s effective. Staging latency
 still binds; cp.async into shared is the next lever. The pinned rerun
 joins the next measurement pass.
 
+R3.6 (2026-11-04, separate commit): chunk staging now rides cp.async
+straight into shared — the x tile lands without a register round trip,
+and the packed W words land in a small shared stage and pay the round
+trip through the dequant; scales/zeros still ride registers. Issue runs
+two chunks ahead of the MMA (xs three slots deep, ws and the W stage
+two), still one `__syncthreads` per chunk, and the next chunk's dequant
+sits between issue and MMA with no barrier of its own. Occupancy goes
+2 -> 3 blocks/SM (96 -> 57 registers, 25.6 -> 31.7 KB shared). Numerics
+unchanged; CTest 2/2. The A/B against the R3.5 binary is unpinned and
+unresolvable — a low-power session (triads 259–265 GB/s) with clock
+migration up to 4x inside single cases; on fast-window minima cp.async
+is parity with register prefetch, 0.92–1.13x per case depending on the
+sample. A hybrid that keeps W on registers and cp.asyncs only x (the
+dequant then never waits on the async pipe) measured the same parity
+and was rejected — dropping the register ride was the point of the
+rung. The staging restructure is now measured out as the lever: three
+designs — single-buffer, register prefetch, cp.async — land within
+noise of each other at 25–45 GB/s effective, so the binding constraint
+is something none of them touched. The table above stays the
+single-buffered pinned run of record; the pinned rerun of the pipeline
+rungs joins the next measurement pass (this session had no sudo for the
+governor/profile pin).
+
 ## R5 contents (2026-10-31 — KV-cache decode attention)
 
 - `include/w4/kvcache.hpp` (scaffold commit) — the cache as H independent
@@ -383,10 +406,10 @@ dequant, read W in the GEMM) that a fused kernel eliminates entirely.
 ## Stretch
 
 - Emulated formats beyond the two landed (MXFP4 GEMM, E4M3 KV); the
-  chunk-staged V pass named in the R5 numbers; cp.async staging for the
-  MMA pipeline and the SIMT/MMA dispatcher; the paged page-size sweep;
-  the equal-bytes experiment the flash path now reaches — W4 at 4x the
-  context length for the FP16 cache's bytes, at the same latency class.
+  chunk-staged V pass named in the R5 numbers; the SIMT/MMA dispatcher;
+  the paged page-size sweep; the equal-bytes experiment the flash path
+  now reaches — W4 at 4x the context length for the FP16 cache's bytes,
+  at the same latency class.
 
 ## Ceiling honesty
 
