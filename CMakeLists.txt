@@ -49,6 +49,10 @@ target_link_libraries(test_oracle PRIVATE w4)
 target_compile_options(test_oracle PRIVATE -Wall -Wextra)
 add_test(NAME oracle COMMAND test_oracle)
 
+add_executable(error_analysis benchmarks/error_analysis.cpp)
+target_link_libraries(error_analysis PRIVATE w4)
+target_compile_options(error_analysis PRIVATE -Wall -Wextra)
+
 add_executable(test_gpu tests/test_gpu.cu)
 target_link_libraries(test_gpu PRIVATE w4 CUDA::cublas)
 target_compile_options(test_gpu PRIVATE -Wall -Wextra)

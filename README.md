@@ -1,6 +1,8 @@
 # W4A16 Fused Dequant GEMM
 
-**STATUS: R7 complete — split-S flash decode attention (S past the old
+**STATUS: R8 complete — the SIMT/MMA dispatcher (`gemm` / `gemm_mx`)
+landed and gated on the pinned crossover: SIMT below M=9, MMA from there.
+R7: split-S flash decode attention (S past the old
 single-block 4096 bound), FP8 (E4M3) KV cache, and paged W4 with prefix
 sharing landed and gated on top of the R5 KV rung. Flash FP16 runs at
 triad at large S and beats the single-block baseline everywhere (up to
@@ -208,6 +210,35 @@ samples, all at 28–32 W between-case transitions; every run's triad
 sat in the 341–342 band and MMA rep spreads stayed <= 1.02 apart from
 one 1.11 on the 0.25 ms M=1/N=4096 case.
 
+## R8 contents (2026-11-05 — SIMT/MMA dispatcher)
+
+- `include/w4/dispatch.cuh` — `gemm` / `gemm_mx`: one host-side branch on
+  M picks the kernel per call. M < 9 → the SIMT fused kernel; M >= 9 →
+  MMA. The crossover is the pinned run of record, not an argument: SIMT
+  leads through M=8 (2.29x / 2.87x vs MMA's 1.35x / 1.92x), MMA is within
+  noise at M=16/N=4096 (1.38x vs SIMT's 1.37x) and leads everywhere from
+  there, and it is the only path that does not lose at M=64. The MX pinned
+  table reproduces the same picture on a different dequant arithmetic
+  (SIMT 2.01x / 2.43x at M=8; MMA wins from M=16), so one threshold serves
+  both. N is not dispatched on: the only split cell (W4, M=16, N=4096) is
+  a wash. (The R3 numbers section's coarse "SIMT M <= 16" read predates
+  the MX table and the 2026-11-04 pinned rerun; the gated crossover sits
+  at M=9.) Dispatch changes which kernel runs, never what it computes:
+  both callees share `dequant_one` and carry the same `w_out` hook.
+- Gates: dispatch output memcmp'd against the expected callee's output on
+  the full config matrix — the routing is pinned bitwise — `w_out` bitwise
+  through the dispatch, and entry contracts thrown on both sides of the
+  threshold. CTest 2/2 = 568 device + 212922 host checks, zero warnings.
+- The two named MMA re-opens were exercised the same day and rejected on
+  measurement (variants bitwise-gated against the tip, 9 reps, triad
+  341.1 GB/s): chunk 64 loses 26–29% at every shape (the 48 KB
+  static-shared limit forces two-slot buffers and issue-1-ahead; occupancy
+  3 -> 2 blocks/SM) — the R3 rejection stands post-pipelining; one barrier
+  per two chunks loses 1–7% (four-slot buffers, 2 blocks/SM — the halved
+  barrier count does not pay for the lost occupancy). The MMA kernel is
+  not staging-bound, not barrier-bound, not chunk-size-bound: what remains
+  is the instruction stream itself. No further MMA levers are chartered.
+
 ## R5 contents (2026-10-31 — KV-cache decode attention)
 
 - `include/w4/kvcache.hpp` (scaffold commit) — the cache as H independent
@@ -349,6 +380,17 @@ Paged vs contiguous flashw4 at page=16: 0.51–0.66x — the block-table
 indirection costs a third to a half at small pages; the page-size sweep
 is the recorded lever.
 
+(2026-11-05: the sweep ran — page in {16, 32, 64, 128, 256}, shuffled and
+in-order block tables, six (H, S) cells up to H=32/S=32768, bitwise clean
+at every cell. The ratio is FLAT: 0.60–0.64x at every page size, and
+shuffled placement costs nothing against in-order. The paged tax is not
+per-page table lookups and not placement; it is per-position address
+arithmetic — the runtime `pos / page` and `pos % page` on every position
+of both walks, which a power-of-two page size cannot remove because
+`page` is a runtime value. The renamed lever: a power-of-two fast path
+(shift/mask for power-of-two pages) or page-aligned tiling — a kernel
+change, recorded not done.)
+
 ## R2 contents (2026-10-31)
 
 - `include/w4/fused.cuh` — fused dequant+GEMM (`gemm_fused`). One warp per
@@ -416,14 +458,18 @@ dequant, read W in the GEMM) that a fused kernel eliminates entirely.
 - Success = meaningful fraction of peak DRAM bandwidth **plus** a written
   error analysis vs FP16 reference (where the error lives, group-size
   sensitivity). The error analysis is the numerics-engineer tell.
+  **Landed: `ERROR_ANALYSIS.md`, numbers from
+  `benchmarks/error_analysis.cpp` (host, fixed seeds, exactly
+  reproducible).**
 
 ## Stretch
 
 - Emulated formats beyond the two landed (MXFP4 GEMM, E4M3 KV); the
-  chunk-staged V pass named in the R5 numbers; the SIMT/MMA dispatcher;
-  the paged page-size sweep; the equal-bytes experiment the flash path
-  now reaches — W4 at 4x the context length for the FP16 cache's bytes,
-  at the same latency class.
+  chunk-staged V pass named in the R5 numbers; the paged power-of-two
+  fast path (the sweep showed the tax is per-position div/mod, not page
+  size); the equal-bytes experiment the flash path now reaches — W4 at
+  4x the context length for the FP16 cache's bytes, at the same latency
+  class.
 
 ## Ceiling honesty
 

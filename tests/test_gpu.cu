@@ -27,12 +27,18 @@
 //      2e-3. Configs cover S=1, ragged words (D=96), both sign modes, and
 //      S=4096 exactly on the shared-memory bound; entry contracts throw
 //      past it.
+//   8. The SIMT/MMA dispatcher (gemm/gemm_mx): output must be bitwise
+//      identical to the callee the crossover selects (SIMT below
+//      DISPATCH_MMA_MIN_M, MMA from there), and the w_out hook must stay
+//      bitwise through the dispatch; entry contracts throw on both sides
+//      of the threshold.
 
 #include <cstdio>
 #include <cstring>
 #include <vector>
 
 #include "w4/dequant.cuh"
+#include "w4/dispatch.cuh"
 #include "w4/fused.cuh"
 #include "w4/kvattention.cuh"
 #include "w4/kvflash.cuh"
@@ -199,6 +205,7 @@ int main() {
             "FAIL fused-vs-cublas %s M=%d N=%d K=%d gs=%d rel=%.3e\n",
             sym ? "sym" : "asym", c.M, c.N, c.K, c.gs, rel_x);
       }
+      const std::vector<__half> c_simt = c_fused;
 
       // MMA kernel: same gates as the fused path (bitwise dequant through
       // w_out, oracle at 1e-3, cuBLAS cross-check at 2e-3).
@@ -243,6 +250,39 @@ int main() {
         ++fails;
         std::printf("FAIL mma-vs-cublas %s M=%d N=%d K=%d gs=%d rel=%.3e\n",
                     sym ? "sym" : "asym", c.M, c.N, c.K, c.gs, rel_mx);
+      }
+
+      // Dispatcher: the w_out hook must stay bitwise through the dispatch,
+      // and the output must memcmp against the callee the crossover selects
+      // — SIMT below DISPATCH_MMA_MIN_M (c_simt), MMA from there (c_fused).
+      w4::gpu::gemm(dp, x_d, c_f, c.M, 0, w_d);
+      w4::gpu::cuda_check(cudaDeviceSynchronize(), "dispatch w_out sync");
+      w4::gpu::cuda_check(cudaMemcpy(w_gpu.data(), w_d,
+                                     (size_t)c.N * c.K * sizeof(__half),
+                                     cudaMemcpyDeviceToHost),
+                          "down w dispatch");
+      ++checks;
+      if (std::memcmp(w_gpu.data(), w_ref.data(),
+                      (size_t)c.N * c.K * sizeof(__half)) != 0) {
+        ++fails;
+        std::printf("FAIL dispatch dequant bitwise %s M=%d N=%d K=%d gs=%d\n",
+                    sym ? "sym" : "asym", c.M, c.N, c.K, c.gs);
+      }
+      w4::gpu::gemm(dp, x_d, c_f, c.M);
+      w4::gpu::cuda_check(cudaDeviceSynchronize(), "dispatch sync");
+      std::vector<__half> c_disp((size_t)c.M * c.N);
+      w4::gpu::cuda_check(cudaMemcpy(c_disp.data(), c_f,
+                                     (size_t)c.M * c.N * sizeof(__half),
+                                     cudaMemcpyDeviceToHost),
+                          "down c dispatch");
+      const std::vector<__half>& c_winner =
+          c.M < w4::gpu::DISPATCH_MMA_MIN_M ? c_simt : c_fused;
+      ++checks;
+      if (std::memcmp(c_disp.data(), c_winner.data(),
+                      (size_t)c.M * c.N * sizeof(__half)) != 0) {
+        ++fails;
+        std::printf("FAIL dispatch routing %s M=%d N=%d K=%d gs=%d\n",
+                    sym ? "sym" : "asym", c.M, c.N, c.K, c.gs);
       }
 
       cudaFree(c_f);
@@ -371,6 +411,7 @@ int main() {
       std::printf("FAIL mx fused-vs-cublas M=%d N=%d K=%d rel=%.3e\n", c.M,
                   c.N, c.K, rel_x);
     }
+    const std::vector<__half> c_simt_mx = c_fused;
 
     // MMA MX: same gates.
     w4::gpu::gemm_mma_mx(dp, x_d, c_f, c.M, 0, w_d);
@@ -414,6 +455,38 @@ int main() {
       ++fails;
       std::printf("FAIL mx mma-vs-cublas M=%d N=%d K=%d rel=%.3e\n", c.M, c.N,
                   c.K, rel_mx);
+    }
+
+    // MX dispatcher: same gates as the W4 dispatch — hook bitwise, output
+    // memcmp against the callee the crossover selects.
+    w4::gpu::gemm_mx(dp, x_d, c_f, c.M, 0, w_d);
+    w4::gpu::cuda_check(cudaDeviceSynchronize(), "mx dispatch w_out sync");
+    w4::gpu::cuda_check(cudaMemcpy(w_gpu.data(), w_d,
+                                   (size_t)c.N * c.K * sizeof(__half),
+                                   cudaMemcpyDeviceToHost),
+                        "down mx w dispatch");
+    ++checks;
+    if (std::memcmp(w_gpu.data(), w_ref.data(),
+                    (size_t)c.N * c.K * sizeof(__half)) != 0) {
+      ++fails;
+      std::printf("FAIL mx dispatch dequant bitwise M=%d N=%d K=%d\n", c.M,
+                  c.N, c.K);
+    }
+    w4::gpu::gemm_mx(dp, x_d, c_f, c.M);
+    w4::gpu::cuda_check(cudaDeviceSynchronize(), "mx dispatch sync");
+    std::vector<__half> c_disp_mx((size_t)c.M * c.N);
+    w4::gpu::cuda_check(cudaMemcpy(c_disp_mx.data(), c_f,
+                                   (size_t)c.M * c.N * sizeof(__half),
+                                   cudaMemcpyDeviceToHost),
+                        "down mx c dispatch");
+    const std::vector<__half>& c_winner_mx =
+        c.M < w4::gpu::DISPATCH_MMA_MIN_M ? c_simt_mx : c_fused;
+    ++checks;
+    if (std::memcmp(c_disp_mx.data(), c_winner_mx.data(),
+                    (size_t)c.M * c.N * sizeof(__half)) != 0) {
+      ++fails;
+      std::printf("FAIL mx dispatch routing M=%d N=%d K=%d\n", c.M, c.N,
+                  c.K);
     }
 
     cudaFree(q_d);
@@ -1562,6 +1635,28 @@ int main() {
                  [&] { w4::gpu::gemm_mma_mx(huge_mx, out, out, 2); }),
              "mx mma N overflow");
     }
+
+    // Dispatcher entry contracts: malformed input must throw on both sides
+    // of the threshold (M=2 routes SIMT, M=16 routes MMA), and the dispatch
+    // inherits the MMA launch bound past the threshold.
+    expect(throws_invalid([&] { w4::gpu::gemm(bad_gs0, out, out, 2); }),
+           "dispatch gs=0 simt side");
+    expect(throws_invalid([&] { w4::gpu::gemm(bad_gs0, out, out, 16); }),
+           "dispatch gs=0 mma side");
+    expect(throws_invalid([&] { w4::gpu::gemm(good, nullptr, out, 2); }),
+           "dispatch x null");
+    expect(throws_invalid([&] { w4::gpu::gemm(good, out, out, 0); }),
+           "dispatch M=0");
+    expect(throws_invalid([&] { w4::gpu::gemm(good, out, out, 4194241); }),
+           "dispatch M past mma grid.y bound");
+    expect(throws_invalid([&] { w4::gpu::gemm_mx(bad_mxb, out, out, 2); }),
+           "dispatch mx B wrong simt side");
+    expect(throws_invalid([&] { w4::gpu::gemm_mx(bad_mxb, out, out, 16); }),
+           "dispatch mx B wrong mma side");
+    expect(throws_invalid([&] { w4::gpu::gemm_mx(good_mx, out, out, 0); }),
+           "dispatch mx M=0");
+    expect(throws_invalid([&] { w4::gpu::gemm_mx(good_mx, out, out, 4194241); }),
+           "dispatch mx M past mma grid.y bound");
 
     // KV attention entry contracts: dims, the S/D shared-memory bounds, gs,
     // G consistency, null pointers, zeros discipline.
