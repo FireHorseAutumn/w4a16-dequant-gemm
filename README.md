@@ -164,12 +164,14 @@ R3.5 (2026-11-03, separate commit): the chunk loop is now double-buffered
 — the next chunk's packed word, scale/zero, and x slivers prefetch into
 registers under the current chunk's MMA, ws/xs alternate two shared
 buffers, one `__syncthreads` per chunk instead of two. Numerics
-unchanged; CTest 2/2. The table above stays the single-buffered pinned
-run of record: the replacement measured flat at N=4096 and +4–6% at
-N=14336 in an unpinned same-session A/B (triad 264–265 GB/s, a
-low-power-profile session), still 25–45 GB/s effective. Staging latency
-still binds; cp.async into shared is the next lever. The pinned rerun
-joins the next measurement pass.
+unchanged; CTest 2/2. An unpinned same-session A/B against the
+single-buffered build (triad 264–265 GB/s, a low-power-profile session)
+showed flat at N=4096 and +4–6% at N=14336. The pinned A/B
+(2026-11-04, triad 341–342 GB/s) does not reproduce the gain:
+1.35–1.44x at N=4096 and 1.82–1.88x at N=14336 — the single-buffered
+table within a few hundredths. The +4–6% was a low-power-session
+artifact; register prefetch is pinned parity with single-buffering,
+still 35–46 GB/s effective.
 
 R3.6 (2026-11-04, separate commit): chunk staging now rides cp.async
 straight into shared — the x tile lands without a register round trip,
@@ -179,20 +181,32 @@ two chunks ahead of the MMA (xs three slots deep, ws and the W stage
 two), still one `__syncthreads` per chunk, and the next chunk's dequant
 sits between issue and MMA with no barrier of its own. Occupancy goes
 2 -> 3 blocks/SM (96 -> 57 registers, 25.6 -> 31.7 KB shared). Numerics
-unchanged; CTest 2/2. The A/B against the R3.5 binary is unpinned and
-unresolvable — a low-power session (triads 259–265 GB/s) with clock
-migration up to 4x inside single cases; on fast-window minima cp.async
-is parity with register prefetch, 0.92–1.13x per case depending on the
+unchanged; CTest 2/2. The landing-day A/B against the R3.5 binary was
+unpinned and unresolvable — a low-power session (triads 259–265 GB/s)
+with clock migration up to 4x inside single cases; on fast-window
+minima cp.async read as parity, 0.92–1.13x per case depending on the
 sample. A hybrid that keeps W on registers and cp.asyncs only x (the
 dequant then never waits on the async pipe) measured the same parity
 and was rejected — dropping the register ride was the point of the
-rung. The staging restructure is now measured out as the lever: three
-designs — single-buffer, register prefetch, cp.async — land within
-noise of each other at 25–45 GB/s effective, so the binding constraint
-is something none of them touched. The table above stays the
-single-buffered pinned run of record; the pinned rerun of the pipeline
-rungs joins the next measurement pass (this session had no sudo for the
-governor/profile pin).
+rung. The pinned A/B landed the same day (governor + platform profile
+performance, two interleaved runs per binary, triads 341.1–342.3 GB/s,
+run-to-run medians within 0.5%): parity at N=4096 for M >= 8, +2% at
+M=64/N=4096, but 3.5% slower at M=1/N=4096 and 1.4–4.2% slower at
+N=14336 for M <= 16 — pinned, the async pipe is parity-to-slightly-
+slower than the register ride. The staging restructure is measured out
+as the lever across all three designs: single-buffer, register
+prefetch, and cp.async land within a few percent of each other at
+34–46 GB/s effective, so the binding constraint is something none of
+them touched. The per-chunk barrier and the chunk size itself are the
+named re-opens (the R3 chunk-64 rejection predates pipelining).
+`data/w4a16_fused_bench.json` is now this session's tip run; the R3
+table above stays the single-buffered run of record (its JSON is in
+git history at `1d65ece`), and the run's SIMT column reproduces the R2
+pinned table to a few hundredths a third time. One caveat, recorded
+plainly: the sampler logged transient SW-power-cap flags in 14 of 360
+samples, all at 28–32 W between-case transitions; every run's triad
+sat in the 341–342 band and MMA rep spreads stayed <= 1.02 apart from
+one 1.11 on the 0.25 ms M=1/N=4096 case.
 
 ## R5 contents (2026-10-31 — KV-cache decode attention)
 
