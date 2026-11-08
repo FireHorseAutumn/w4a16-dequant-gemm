@@ -61,9 +61,10 @@ __global__ void dequant_kernel(DevicePackedW p, __half* w) {
 
 inline void dequant(const DevicePackedW& p, __half* w, cudaStream_t stream = 0) {
   if (p.N < 1 || p.K < 1) throw std::invalid_argument("dequant: bad dims");
+  if (p.K > W4_MAX_K) throw std::invalid_argument("dequant: K out of range");
   if (p.gs < 8 || p.gs % 8 != 0)
     throw std::invalid_argument("dequant: gs must be a multiple of 8");
-  if (p.G != (p.K + p.gs - 1) / p.gs)
+  if ((int64_t)p.G != ((int64_t)p.K + p.gs - 1) / p.gs)
     throw std::invalid_argument("dequant: G inconsistent with K, gs");
   if (!p.q || !p.scales || !w)
     throw std::invalid_argument("dequant: null pointer");

@@ -140,6 +140,28 @@ int main() {
     auto bad_sizes = p;
     bad_sizes.q.resize(3);
     expect(throws_invalid([&] { w4::dequant_all(bad_sizes); }), "dequant size");
+    // K past the 32-bit kernel bound: the host paths reject it too, so an
+    // artifact the device entries refuse cannot be built here.
+    expect(throws_invalid([&] { w4::quantize(ok, 1, INT32_MAX, 8, true); }),
+           "quantize K bound");
+    auto bad_k = p;
+    bad_k.K = INT32_MAX;
+    expect(throws_invalid([&] { w4::dequant_all(bad_k); }), "dequant K bound");
+    // Huge gs (a multiple of 8 past INT32_MAX - K) used to signed-overflow
+    // the G ceil-add (UBSan trap); G = 1 now, and the artifact is identical
+    // to gs >= K in range.
+    {
+      const std::vector<double> row(64, 0.5);
+      const auto wide = w4::quantize(row, 1, 64, INT32_MAX - 7, true);
+      const auto ref64 = w4::quantize(row, 1, 64, 64, true);
+      ++checks;
+      if (wide.G != 1 || wide.q != ref64.q ||
+          std::memcmp(wide.scales.data(), ref64.scales.data(),
+                      sizeof(__half)) != 0) {
+        ++fails;
+        std::printf("FAIL huge gs: G=%d\n", wide.G);
+      }
+    }
     expect(throws_invalid([&] {
              w4::gemm_oracle(std::vector<__half>(3), 2, 2,
                              std::vector<__half>(4), 1);
@@ -298,6 +320,12 @@ int main() {
       bad_sizes.q.resize(3);
       expect(throws_invalid([&] { w4::mx::dequant_all_mx(bad_sizes); }),
              "mx dequant size");
+      expect(throws_invalid([&] { w4::mx::quantize_mx(ok, 1, INT32_MAX); }),
+             "mx quantize K bound");
+      auto bad_k = p;
+      bad_k.K = INT32_MAX;
+      expect(throws_invalid([&] { w4::mx::dequant_all_mx(bad_k); }),
+             "mx dequant K bound");
     }
   }
 

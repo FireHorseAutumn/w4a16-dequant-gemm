@@ -173,9 +173,10 @@ inline void gemm_fused(const DevicePackedW& p, const __half* x, __half* c,
                        int M, cudaStream_t stream = 0,
                        __half* w_out = nullptr) {
   if (p.N < 1 || p.K < 1) throw std::invalid_argument("fused: bad dims");
+  if (p.K > W4_MAX_K) throw std::invalid_argument("fused: K out of range");
   if (p.gs < 8 || p.gs % 8 != 0)
     throw std::invalid_argument("fused: gs must be a multiple of 8");
-  if (p.G != (p.K + p.gs - 1) / p.gs)
+  if ((int64_t)p.G != ((int64_t)p.K + p.gs - 1) / p.gs)
     throw std::invalid_argument("fused: G inconsistent with K, gs");
   if (!p.q || !p.scales || !x || !c)
     throw std::invalid_argument("fused: null pointer");

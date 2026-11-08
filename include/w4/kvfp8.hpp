@@ -57,7 +57,7 @@ inline void validate_cache_f8(const KVCacheF8& c) {
     throw std::invalid_argument("cache f8: bad dims");
   if (c.gs < 8 || c.gs % 8 != 0)
     throw std::invalid_argument("cache f8: gs must be a multiple of 8");
-  if (c.G != (c.D + c.gs - 1) / c.gs)
+  if ((int64_t)c.G != ((int64_t)c.D + c.gs - 1) / c.gs)
     throw std::invalid_argument("cache f8: G inconsistent with D, gs");
   const size_t qb = (size_t)c.H * c.S * c.D;
   const size_t sw = (size_t)c.H * c.S * c.G;
@@ -87,7 +87,7 @@ inline KVCacheF8 quantize_cache_f8(const std::vector<double>& k,
   c.S = S;
   c.D = D;
   c.gs = gs;
-  c.G = (D + gs - 1) / gs;
+  c.G = (int)(((int64_t)D + gs - 1) / gs);
   c.q_k.assign((size_t)H * S * D, 0);
   c.q_v.assign((size_t)H * S * D, 0);
   c.s_k.assign((size_t)H * S * c.G, __float2half_rn(0.0f));

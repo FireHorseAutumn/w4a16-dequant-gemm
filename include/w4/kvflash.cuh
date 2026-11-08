@@ -41,7 +41,7 @@ inline void validate_kv_flash(const DeviceKVW4& p) {
     throw std::invalid_argument("kv flash: D exceeds the shared-memory bound");
   if (p.gs < 8 || p.gs % 8 != 0)
     throw std::invalid_argument("kv flash: gs must be a multiple of 8");
-  if (p.G != (p.D + p.gs - 1) / p.gs)
+  if ((int64_t)p.G != ((int64_t)p.D + p.gs - 1) / p.gs)
     throw std::invalid_argument("kv flash: G inconsistent with D, gs");
   if (!p.q_k || !p.s_k || !p.q_v || !p.s_v)
     throw std::invalid_argument("kv flash: null pointer");
@@ -402,7 +402,7 @@ inline void validate_kv_f8(const DeviceKVF8& p) {
     throw std::invalid_argument("kv f8 flash: D exceeds the shared bound");
   if (p.gs < 8 || p.gs % 8 != 0)
     throw std::invalid_argument("kv f8 flash: gs must be a multiple of 8");
-  if (p.G != (p.D + p.gs - 1) / p.gs)
+  if ((int64_t)p.G != ((int64_t)p.D + p.gs - 1) / p.gs)
     throw std::invalid_argument("kv f8 flash: G inconsistent with D, gs");
   if (!p.q_k || !p.s_k || !p.q_v || !p.s_v)
     throw std::invalid_argument("kv f8 flash: null pointer");
@@ -421,7 +421,7 @@ __global__ void dequant_kernel_f8(const uint8_t* __restrict__ q,
   if (idx >= S * wpr) return;
   const int t = idx / wpr;
   const int d0 = 4 * (idx % wpr);
-  const int G = (D + gs - 1) / gs;
+  const int G = (int)(((int64_t)D + gs - 1) / gs);
   const __half sc = s[(size_t)t * G + d0 / gs];
   const uint32_t qw = ((const uint32_t*)(q + (size_t)t * D))[idx % wpr];
 #pragma unroll
@@ -736,7 +736,7 @@ inline void attention_w4_flash_paged(const DeviceKVW4& p, const int* bt,
     throw std::invalid_argument("kv paged flash: D exceeds the shared bound");
   if (p.gs < 8 || p.gs % 8 != 0)
     throw std::invalid_argument("kv paged flash: gs must be a multiple of 8");
-  if (p.G != (p.D + p.gs - 1) / p.gs)
+  if ((int64_t)p.G != ((int64_t)p.D + p.gs - 1) / p.gs)
     throw std::invalid_argument("kv paged flash: G inconsistent with D, gs");
   if (!p.q_k || !p.s_k || !p.q_v || !p.s_v || !bt)
     throw std::invalid_argument("kv paged flash: null pointer");

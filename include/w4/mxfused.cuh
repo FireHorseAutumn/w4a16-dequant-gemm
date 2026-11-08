@@ -31,6 +31,7 @@ struct DevicePackedWm {
 
 inline void validate_mx(const DevicePackedWm& p) {
   if (p.N < 1 || p.K < 1) throw std::invalid_argument("mx: bad dims");
+  if (p.K > W4_MAX_K) throw std::invalid_argument("mx: K out of range");
   if (p.B != mx::blocks(p.K))
     throw std::invalid_argument("mx: B inconsistent with K");
   if (!p.q || !p.scales) throw std::invalid_argument("mx: null pointer");

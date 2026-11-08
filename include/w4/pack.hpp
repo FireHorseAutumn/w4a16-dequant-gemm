@@ -30,7 +30,12 @@
 
 namespace w4 {
 
-W4_HD inline int words(int n) { return (n + 7) / 8; }
+W4_HD inline int words(int n) { return (int)(((int64_t)n + 7) / 8); }
+
+// Every kernel walks K with 32-bit ints and ceil-adds (words, chunk counts,
+// k0 = 8*w). K is bounded so none of that can wrap; the slack covers the
+// 32-wide chunk ceil-add in the MMA kernels.
+constexpr int W4_MAX_K = INT32_MAX - 31;
 
 struct PackedW {
   int N = 0, K = 0, gs = 0, G = 0;
@@ -64,6 +69,7 @@ W4_HD inline __half dequant_one(__half s, int q, int z) {
 inline PackedW quantize(const std::vector<double>& w, int N, int K, int gs,
                         bool symmetric) {
   if (N < 1 || K < 1) throw std::invalid_argument("quantize: bad dims");
+  if (K > W4_MAX_K) throw std::invalid_argument("quantize: K out of range");
   if (gs < 8 || gs % 8 != 0)
     throw std::invalid_argument("quantize: gs must be a multiple of 8");
   if (w.size() != (size_t)N * (size_t)K)
@@ -75,7 +81,7 @@ inline PackedW quantize(const std::vector<double>& w, int N, int K, int gs,
   p.N = N;
   p.K = K;
   p.gs = gs;
-  p.G = (K + gs - 1) / gs;
+  p.G = (int)(((int64_t)K + gs - 1) / gs);
   p.symmetric = symmetric;
   p.q.assign((size_t)N * words(K), 0);
   p.scales.assign((size_t)N * p.G, __float2half_rn(0.0f));
@@ -133,9 +139,10 @@ inline PackedW quantize(const std::vector<double>& w, int N, int K, int gs,
 // route through this; a malformed PackedW is rejected, never read.
 inline void validate_packed(const PackedW& p) {
   if (p.N < 1 || p.K < 1) throw std::invalid_argument("packed: bad dims");
+  if (p.K > W4_MAX_K) throw std::invalid_argument("packed: K out of range");
   if (p.gs < 8 || p.gs % 8 != 0)
     throw std::invalid_argument("packed: gs must be a multiple of 8");
-  if (p.G != (p.K + p.gs - 1) / p.gs)
+  if ((int64_t)p.G != ((int64_t)p.K + p.gs - 1) / p.gs)
     throw std::invalid_argument("packed: G inconsistent with K, gs");
   if (p.q.size() != (size_t)p.N * (size_t)words(p.K))
     throw std::invalid_argument("packed: q size");

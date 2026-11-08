@@ -38,7 +38,7 @@ inline void validate_cache(const KVCacheW4& c) {
     throw std::invalid_argument("cache: bad dims");
   if (c.gs < 8 || c.gs % 8 != 0)
     throw std::invalid_argument("cache: gs must be a multiple of 8");
-  if (c.G != (c.D + c.gs - 1) / c.gs)
+  if ((int64_t)c.G != ((int64_t)c.D + c.gs - 1) / c.gs)
     throw std::invalid_argument("cache: G inconsistent with D, gs");
   const size_t qw = (size_t)c.H * c.S * words(c.D);
   const size_t sw = (size_t)c.H * c.S * c.G;
@@ -71,7 +71,7 @@ inline KVCacheW4 quantize_cache(const std::vector<double>& k,
   c.S = S;
   c.D = D;
   c.gs = gs;
-  c.G = (D + gs - 1) / gs;
+  c.G = (int)(((int64_t)D + gs - 1) / gs);
   c.symmetric = symmetric;
   const size_t qw = (size_t)H * S * words(D);
   const size_t sw = (size_t)H * S * c.G;

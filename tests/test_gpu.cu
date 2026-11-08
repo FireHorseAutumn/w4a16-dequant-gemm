@@ -1526,6 +1526,18 @@ int main() {
     auto big = good; big.N = 1 << 21; big.K = 8192; big.G = 1024;
     expect(throws_invalid([&] { w4::gpu::dequant(big, out); }),
            "total >= 2^31");
+    // K past the 32-bit index headroom bound (W4_MAX_K): the ceil-adds in
+    // words()/nchunks and the k0 = 8*w walks would wrap. Before the bound,
+    // a crafted G matching the wrapped arithmetic passed validation and the
+    // launcher threw runtime_error off a wrapped grid (or faulted in the
+    // MMA kernel); every entry now rejects it pre-launch.
+    auto huge_k = good; huge_k.K = INT32_MAX; huge_k.G = 1;
+    expect(throws_invalid([&] { w4::gpu::dequant(huge_k, out); }),
+           "dequant K bound");
+    expect(throws_invalid([&] { w4::gpu::gemm_fused(huge_k, out, out, 2); }),
+           "fused K bound");
+    expect(throws_invalid([&] { w4::gpu::gemm_mma(huge_k, out, out, 2); }),
+           "mma K bound");
     cublasHandle_t h = w4::gpu::make_cublas();
     expect(throws_invalid(
                [&] { w4::gpu::gemm_fp16(h, out, out, out, 0, 2, 2); }),
@@ -1621,6 +1633,15 @@ int main() {
            "mx dequant w null");
     expect(throws_invalid([&] { w4::gpu::dequant_mx(big_mx, out); }),
            "mx dequant total >= 2^31");
+    {
+      auto big_mxk = good_mx; big_mxk.K = INT32_MAX;
+      expect(throws_invalid([&] { w4::gpu::dequant_mx(big_mxk, out); }),
+             "mx dequant K bound");
+      expect(throws_invalid([&] { w4::gpu::gemm_fused_mx(big_mxk, out, out, 2); }),
+             "mx fused K bound");
+      expect(throws_invalid([&] { w4::gpu::gemm_mma_mx(big_mxk, out, out, 2); }),
+             "mx mma K bound");
+    }
     expect(throws_invalid([&] { w4::gpu::gemm_fused_mx(bad_mxb, out, out, 2); }),
            "mx fused B wrong");
     expect(throws_invalid([&] { w4::gpu::gemm_fused_mx(good_mx, nullptr, out, 2); }),

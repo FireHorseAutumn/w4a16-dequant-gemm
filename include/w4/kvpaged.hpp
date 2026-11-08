@@ -38,7 +38,7 @@ inline void validate_paged(const KVCacheW4Paged& c) {
     throw std::invalid_argument("paged: bad dims");
   if (c.gs < 8 || c.gs % 8 != 0)
     throw std::invalid_argument("paged: gs must be a multiple of 8");
-  if (c.G != (c.D + c.gs - 1) / c.gs)
+  if ((int64_t)c.G != ((int64_t)c.D + c.gs - 1) / c.gs)
     throw std::invalid_argument("paged: G inconsistent with D, gs");
   if (c.page < 1 || c.npages < 1)
     throw std::invalid_argument("paged: bad page geometry");

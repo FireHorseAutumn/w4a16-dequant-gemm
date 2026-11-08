@@ -56,7 +56,7 @@ inline void validate_kv(const DeviceKVW4& p) {
     throw std::invalid_argument("kv: D exceeds the shared-memory bound");
   if (p.gs < 8 || p.gs % 8 != 0)
     throw std::invalid_argument("kv: gs must be a multiple of 8");
-  if (p.G != (p.D + p.gs - 1) / p.gs)
+  if ((int64_t)p.G != ((int64_t)p.D + p.gs - 1) / p.gs)
     throw std::invalid_argument("kv: G inconsistent with D, gs");
   if (!p.q_k || !p.s_k || !p.q_v || !p.s_v)
     throw std::invalid_argument("kv: null pointer");

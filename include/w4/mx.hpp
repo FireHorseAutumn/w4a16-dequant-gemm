@@ -62,7 +62,9 @@ W4_HD inline __half dequant_one_mx(uint8_t se, int q) {
   return __float2half_rn(s * v);
 }
 
-W4_HD inline int blocks(int K) { return (K + MX_BLOCK - 1) / MX_BLOCK; }
+W4_HD inline int blocks(int K) {
+  return (int)(((int64_t)K + MX_BLOCK - 1) / MX_BLOCK);
+}
 
 inline int get_q(const PackedWm& p, int n, int k) {
   return (int)((p.q[(size_t)n * words(p.K) + k / 8] >> (4 * (k % 8))) & 0xF);
@@ -70,6 +72,7 @@ inline int get_q(const PackedWm& p, int n, int k) {
 
 inline PackedWm quantize_mx(const std::vector<double>& w, int N, int K) {
   if (N < 1 || K < 1) throw std::invalid_argument("quantize_mx: bad dims");
+  if (K > W4_MAX_K) throw std::invalid_argument("quantize_mx: K out of range");
   if (w.size() != (size_t)N * (size_t)K)
     throw std::invalid_argument("quantize_mx: size");
   for (const double v : w)
@@ -120,6 +123,8 @@ inline PackedWm quantize_mx(const std::vector<double>& w, int N, int K) {
 
 inline void validate_packed_mx(const PackedWm& p) {
   if (p.N < 1 || p.K < 1) throw std::invalid_argument("packed mx: bad dims");
+  if (p.K > W4_MAX_K)
+    throw std::invalid_argument("packed mx: K out of range");
   if (p.B != blocks(p.K))
     throw std::invalid_argument("packed mx: B inconsistent with K");
   if (p.q.size() != (size_t)p.N * (size_t)words(p.K))
