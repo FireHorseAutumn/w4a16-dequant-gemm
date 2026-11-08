@@ -93,14 +93,20 @@ inline PackedWm quantize_mx(const std::vector<double>& w, int N, int K) {
         amax = std::max(amax, std::fabs(w[(size_t)n * K + k]));
       int e = 0;
       if (amax > 0.0) {
-        e = (int)std::ceil(std::log2(amax / 6.0));
-        // log2 at an exact power of two can land one low; the loop is the
-        // cheap insurance that the no-saturation invariant really holds.
-        while (amax > 6.0 * std::ldexp(1.0, e)) ++e;
-        if (e > 127)
-          throw std::invalid_argument(
-              "quantize_mx: block scale outside E8M0 range");
-        if (e < -127) e = -127;
+        // Subnormal-double input underflows amax/6 to zero, and log2(0) =
+        // -inf must not reach the int cast. Anything at or below the clamp
+        // threshold takes the E8M0 floor directly.
+        if (amax <= 6.0 * std::ldexp(1.0, -127)) {
+          e = -127;
+        } else {
+          e = (int)std::ceil(std::log2(amax / 6.0));
+          // log2 at an exact power of two can land one low; the loop is the
+          // cheap insurance that the no-saturation invariant really holds.
+          while (amax > 6.0 * std::ldexp(1.0, e)) ++e;
+          if (e > 127)
+            throw std::invalid_argument(
+                "quantize_mx: block scale outside E8M0 range");
+        }
       }
       const double s = std::ldexp(1.0, e);
       p.scales[(size_t)n * p.B + b] = (uint8_t)(e + 127);

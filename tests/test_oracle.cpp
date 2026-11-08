@@ -284,6 +284,23 @@ int main() {
       }
     }
 
+    // Subnormal-double input: amax/6 underflows to 0.0, and the old code
+    // fed log2(0) = -inf into the int cast (UB; x86-64 happens to produce
+    // INT32_MIN and clamp to the same answer). The floor branch must be
+    // taken before any log2: scale byte 0, codes 0, dequant exact zero.
+    {
+      std::vector<double> w(32, 0.0);
+      w[0] = 4.9406564584124654e-324;  // DBL_TRUE_MIN
+      const auto p = w4::mx::quantize_mx(w, 1, 32);
+      const auto wd = w4::mx::dequant_all_mx(p);
+      ++checks;
+      if (p.scales[0] != 0 || __half2float(wd[0]) != 0.0f) {
+        ++fails;
+        std::printf("FAIL mx denorm: scale %d value %g\n", (int)p.scales[0],
+                    (double)__half2float(wd[0]));
+      }
+    }
+
     // Throw contracts: NaN, E8M0 overflow, dims, size.
     {
       auto throws_invalid = [](auto&& f) {
