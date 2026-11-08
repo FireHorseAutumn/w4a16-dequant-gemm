@@ -190,9 +190,12 @@ inline void gemm_fused(const DevicePackedW& p, const __half* x, __half* c,
   // gridDim.y caps at 65535, so the m-tiling bounds M; gridDim.x is 2^31-1
   // and N is an int, so only the ceil-rounding add could overflow there.
   // In-kernel address math is size_t throughout, so the 2^31 launch bound
-  // of the dequant kernel does not apply here.
+  // of the dequant kernel does not apply here. The x pre-pass launches
+  // ceil(M*K/256) blocks on gridDim.x, which bounds the product.
   if (M > 65535 * mtile || p.N > INT32_MAX - 8 * rpw)
     throw std::invalid_argument("fused: launch grid out of range");
+  if ((int64_t)M * p.K > (int64_t)INT32_MAX * 256)
+    throw std::invalid_argument("fused: x pre-pass grid out of range");
 
   float* xf = x_scratch((size_t)M * p.K);
   x_to_f32_kernel<<<(unsigned)(((size_t)M * p.K + 255) / 256), 256, 0,

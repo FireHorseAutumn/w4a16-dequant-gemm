@@ -174,9 +174,11 @@ inline void gemm_fused_mx(const DevicePackedWm& p, const __half* x, __half* c,
   const int rpw = M <= 4 ? 1 : 4;
   // Same launch bounds as gemm_fused: gridDim.y caps at 65535 (the
   // m-tiling bounds M); on gridDim.x only the ceil-rounding add can
-  // overflow, N being an int.
+  // overflow, N being an int. The x pre-pass bounds the M*K product.
   if (M > 65535 * mtile || p.N > INT32_MAX - 8 * rpw)
     throw std::invalid_argument("mx fused: launch grid out of range");
+  if ((int64_t)M * p.K > (int64_t)INT32_MAX * 256)
+    throw std::invalid_argument("mx fused: x pre-pass grid out of range");
 
   float* xf = x_scratch((size_t)M * p.K);
   x_to_f32_kernel<<<(unsigned)(((size_t)M * p.K + 255) / 256), 256, 0,

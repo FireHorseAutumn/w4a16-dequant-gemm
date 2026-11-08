@@ -1580,6 +1580,15 @@ int main() {
     // testable here — a passing M would launch against the dummy pointers.
     expect(throws_invalid([&] { w4::gpu::gemm_fused(good, out, out, 262141); }),
            "fused M past grid.y bound");
+    // The x pre-pass launches ceil(M*K/256) on gridDim.x: M at the grid.y
+    // bound times K = 2^22 overflows it (grid.x = 4.3e9). Before the guard
+    // this threw runtime_error from the 4.4 TB scratch allocation.
+    {
+      auto wide_k = good; wide_k.K = 1 << 22; wide_k.G = 1 << 19;
+      expect(throws_invalid(
+                 [&] { w4::gpu::gemm_fused(wide_k, out, out, 262140); }),
+             "fused x pre-pass grid bound");
+    }
     // MMA entry contracts: same structural rules (padding covers shapes).
     expect(throws_invalid([&] { w4::gpu::gemm_mma(bad_gs0, out, out, 2); }),
            "mma gs=0");
@@ -1660,6 +1669,12 @@ int main() {
     expect(throws_invalid(
                [&] { w4::gpu::gemm_fused_mx(good_mx, out, out, 262141); }),
            "mx fused M past grid.y bound");
+    {
+      auto wide_mxk = good_mx; wide_mxk.K = 1 << 22; wide_mxk.B = 1 << 17;
+      expect(throws_invalid(
+                 [&] { w4::gpu::gemm_fused_mx(wide_mxk, out, out, 262140); }),
+             "mx fused x pre-pass grid bound");
+    }
     expect(throws_invalid(
                [&] { w4::gpu::gemm_mma_mx(good_mx, out, out, 4194241); }),
            "mx mma M past grid.y bound");
