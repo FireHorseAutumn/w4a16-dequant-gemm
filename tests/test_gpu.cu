@@ -59,6 +59,20 @@ int main() {
       {33, 48, 104, 24},   // m-tiles with gs % 32 != 0
       {20, 32, 100, 8},    // m-tiles with ragged K
       {65, 96, 100, 16},   // M > 64: multi-m-tile MMA grid, ragged K
+      // The classes vLLM's exllama group walk gets wrong (group switch only
+      // on 32-row steps off each 128-row block: vllm-project/vllm#60921) —
+      // here every word's group is k0 / gs exactly, so these must pass.
+      {1, 128, 512, 16},   // gs=16 across four 128-row blocks
+      {4, 96, 192, 96},    // gs=96, K = 2*gs
+      {4, 96, 320, 160},   // gs=160, K = 2*gs
+      {4, 96, 384, 192},   // gs=192, K = 2*gs
+      {4, 96, 96, 48},     // gs=48, K = 2*gs (not a 32-step multiple)
+      {2, 200, 128, 32},   // N % 128 != 0 at 2 <= M <= 8 (vLLM Humming NaN)
+      {8, 197, 96, 16},    // odd N: partial warp in the SIMT fused kernel
+      {9, 64, 24, 8},      // M=9: the dispatch threshold; single-chunk MMA
+      {9, 64, 33, 8},      // ragged K (K % 8 == 1): one-element second chunk
+      {9, 64, 8, 8},       // one packed word per row
+      {4, 64, 40, 64},     // single group, K % 32 != 0, gs > K
   };
   int checks = 0, fails = 0;
   double worst_rel = 0.0;
@@ -510,6 +524,8 @@ int main() {
     const std::vector<KvCfg> kcfgs = {
         {1, 1, 64, 32},      {2, 7, 64, 8},      {4, 128, 128, 128},
         {2, 300, 96, 32},    {3, 65, 40, 8},     {1, 4096, 64, 64},
+        {2, 33, 44, 8},      // D % 8 != 0: ragged packed words
+        {2, 33, 44, 64},     // gs > D: single ragged group
     };
     for (const bool sym : {true, false}) {
       for (size_t i = 0; i < kcfgs.size(); ++i) {
@@ -934,6 +950,7 @@ int main() {
     const std::vector<KvCfg> kcfgs = {
         {1, 1, 64, 32},    {2, 7, 64, 8},   {4, 128, 128, 128},
         {2, 300, 96, 32},  {3, 65, 40, 8},  {1, 9000, 128, 64},
+        {2, 33, 44, 8},    // D % 8 != 0 (word walk is 4-wide, D % 4 == 0)
     };
     for (size_t i = 0; i < kcfgs.size(); ++i) {
       const KvCfg c = kcfgs[i];
