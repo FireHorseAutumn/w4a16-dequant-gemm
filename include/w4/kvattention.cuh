@@ -4,7 +4,7 @@
 // per head, scores s_t = dot(q, k_t)/sqrt(D) over S cached positions,
 // max-subtracted softmax, output o = sum_t p_t * v_t.
 //
-// attention_w4 dequantizes K and V at load via dequant_one — the FP16
+// attention_w4 dequantizes K and V at load via dequant_one: the FP16
 // cache never materializes, so the K/V streams carry 0.5 bytes per element
 // against the FP16 baseline's 2. attention_fp16 is the same kernel shape
 // over an already-FP16 cache: the honest baseline, isolating the cache
@@ -15,7 +15,7 @@
 // reduction; softmax does two block-wide reductions (max, then sum)
 // through an 8-slot shared array; output: threads stride D, each summing
 // over all positions with scores broadcast from shared. The query is
-// staged in shared as float once — every position re-reads it.
+// staged in shared as float once. Every position re-reads it.
 //
 // Bounds (hard throws at entry): S <= 4096 (scores live in a static shared
 // array, 16 KB), D <= 512 (the shared query stage, 2 KB). Both are

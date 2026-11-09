@@ -2,7 +2,7 @@
 
 // FP8 (E4M3) KV cache, host side (R6): the deployed-incumbent format on
 // the R5 cache structure. One E4M3 byte per element, one FP16 scale per
-// (position, group) — the group machinery is the W4 one, so the gates and
+// (position, group). The group machinery is the W4 one, so the gates and
 // the layout disciplines carry over. E4M3 is signed: no zero-points, no
 // asymmetry mode. Production FP8 KV is often per-tensor scale; per-group
 // is the finer-grained variant, so accuracy figures here flatter FP8
@@ -13,7 +13,7 @@
 //   e == 0:  v = m * 2^-9            (subnormal)
 //   else:    v = (8 + m) * 2^(e-10)  (1 + m/8) * 2^(e-7)
 // NaN encodings (e=15, m=7) are never emitted by the quantizer
-// (SATFINITE caps at ±448 = 0x7E) and decode as 480 if they appear —
+// (SATFINITE caps at ±448 = 0x7E) and decode as 480 if they appear:
 // caches are validated artifacts, so this is documented, not handled.
 //
 // Quantizer rule: group scale s = amax / 448 (no saturation, same ethos

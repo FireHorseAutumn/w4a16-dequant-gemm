@@ -3,7 +3,7 @@
 // Paged W4 KV cache (R7), host side: the R5 slab format with one level of
 // indirection. The physical pool is, per head, npages pages of `page`
 // positions each; a sequence's block table maps logical pages to physical
-// ones. Paging changes where a position lives, never what it contains —
+// ones. Paging changes where a position lives, never what it contains.
 // the dequant-at-load craft and every gate carry over unchanged.
 //
 // The point of paging in production is prefix sharing: two sequences whose

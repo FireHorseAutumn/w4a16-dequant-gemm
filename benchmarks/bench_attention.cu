@@ -4,7 +4,7 @@
 // types. The single-block kernels reject S > 4096 by contract (the shared
 // scores bound); those cases time the flash paths alone, which is the
 // point of R5.5. The two-pass is the fusion denominator; the FP16 paths
-// isolate the cache-bandwidth win — same kernel shape, 4x the K/V bytes.
+// isolate the cache-bandwidth win: same kernel shape, 4x the K/V bytes.
 // Same session, raw per-rep timings preserved, FP64 triad as the bandwidth
 // reference. Byte counts are analytic minima, not measured DRAM traffic.
 //
@@ -165,7 +165,7 @@ Result run_case(const Case& c, int reps, uint64_t seed) {
                        qv8_d, sv8_d};
 
   // Paged pool: page 16, shuffled placement (the worst case for the
-  // indirection). Reuses the q_k/q_v etc. buffers — the pool is the same
+  // indirection). Reuses the q_k/q_v etc. buffers: the pool is the same
   // byte count as the contiguous cache here (npages*page >= S rounds up
   // slightly), so fresh allocations sized to the pool.
   const int page = 16;
@@ -290,7 +290,7 @@ Result run_case(const Case& c, int reps, uint64_t seed) {
   }
 
   // The FP16 cache the baseline reads: dequantized once up front (not
-  // timed — a real FP16 cache simply exists).
+  // timed: a real FP16 cache simply exists).
   for (int h = 0; h < c.H; ++h) {
     const DevicePackedW dk{c.S, c.D, c.gs, cc.G, 1,
                            qk_d + (size_t)h * c.S * wd,

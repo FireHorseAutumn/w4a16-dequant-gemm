@@ -2,8 +2,8 @@
 
 // KV-cache-quantized decode attention (R5), host side: cache format,
 // quantizer, and FP64 reference. The cache is H independent head slabs of
-// the existing PackedW format — positions are rows (N = S), head dim is the
-// contracted axis (K = D), groups partition D — so the R1 quantizer, the
+// the existing PackedW format: positions are rows (N = S), head dim is the
+// contracted axis (K = D), groups partition D. The R1 quantizer, the
 // zero-bracketing fix, and the whole gate matrix carry over unchanged.
 // Contiguous layout, not paged: paging is a serving-systems concern and
 // changes nothing about the dequant-at-load craft this rung exercises.
@@ -56,7 +56,7 @@ inline void validate_cache(const KVCacheW4& c) {
 
 // Quantize both sides of a cache, head by head. k and v are H*S*D,
 // head-major, position-major. The per-head quantize() calls carry all of
-// the R1 contracts (NaN, scale range, dims) — they are not re-checked here.
+// the R1 contracts (NaN, scale range, dims). They are not re-checked here.
 inline KVCacheW4 quantize_cache(const std::vector<double>& k,
                                 const std::vector<double>& v, int H, int S,
                                 int D, int gs, bool symmetric) {

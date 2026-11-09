@@ -28,7 +28,7 @@
 //
 // w_out (test hook): when non-null the kernel also stores each dequantized
 // weight, reproducing dequant_all bitwise. With multiple m-tiles the same
-// values are written to the same locations more than once — racy but
+// values are written to the same locations more than once... racy but
 // byte-identical, so the memcmp gate stays valid.
 
 #include <cuda_fp16.h>
@@ -39,7 +39,7 @@ namespace w4::gpu {
 
 // x is converted to FP32 once per call: the SIMT inner loop would otherwise
 // run __half2float on x per FMA, re-converting the same activations for
-// every row of W (N * M * K converts at M=64 — measured 2 TFLOPS, the
+// every row of W (N * M * K converts at M=64: measured 2 TFLOPS, the
 // converts bound it). The FP32 scratch is M*K*4 bytes, trivial at decode
 // shapes.
 __global__ void x_to_f32_kernel(const __half* __restrict__ x,

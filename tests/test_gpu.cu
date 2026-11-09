@@ -13,12 +13,12 @@
 //      oracle, so they are within 2e-3 of each other).
 //      Configs with M > 16 exercise the gridDim.y m-tiling and its guards.
 
-//   5. mma_kernel (WMMA/tensor-core path): same gates as the fused kernel —
+//   5. mma_kernel (WMMA/tensor-core path): same gates as the fused kernel:
 //      bitwise dequant through w_out, oracle at 1e-3, cuBLAS cross-check at
 //      2e-3. Ragged-K and partial-tile configs exercise the shared-memory
 //      zero padding.
 //   6. MXFP4 kernels (dequant_mx, fused_kernel_mx, mma_kernel_mx): the same
-//      gate set against the MXFP4 host reference — bitwise dequant, oracle
+//      gate set against the MXFP4 host reference: bitwise dequant, oracle
 //      at 1e-3, cuBLAS at 2e-3, entry contracts including the 2^31 bound on
 //      the naive dequant launch.
 //   7. KV-cache decode attention (attention_w4): k_out/v_out hooks reproduce
@@ -60,8 +60,8 @@ int main() {
       {20, 32, 100, 8},    // m-tiles with ragged K
       {65, 96, 100, 16},   // M > 64: multi-m-tile MMA grid, ragged K
       // The classes vLLM's exllama group walk gets wrong (group switch only
-      // on 32-row steps off each 128-row block: vllm-project/vllm#60921) —
-      // here every word's group is k0 / gs exactly, so these must pass.
+      // on 32-row steps off each 128-row block: vllm-project/vllm#60921).
+      // Here every word's group is k0 / gs exactly, so these must pass.
       {1, 128, 512, 16},   // gs=16 across four 128-row blocks
       {4, 96, 192, 96},    // gs=96, K = 2*gs
       {4, 96, 320, 160},   // gs=160, K = 2*gs
@@ -267,8 +267,8 @@ int main() {
       }
 
       // Dispatcher: the w_out hook must stay bitwise through the dispatch,
-      // and the output must memcmp against the callee the crossover selects
-      // — SIMT below DISPATCH_MMA_MIN_M (c_simt), MMA from there (c_fused).
+      // and the output must memcmp against the callee the crossover selects:
+      // SIMT below DISPATCH_MMA_MIN_M (c_simt), MMA from there (c_fused).
       w4::gpu::gemm(dp, x_d, c_f, c.M, 0, w_d);
       w4::gpu::cuda_check(cudaDeviceSynchronize(), "dispatch w_out sync");
       w4::gpu::cuda_check(cudaMemcpy(w_gpu.data(), w_d,
@@ -311,7 +311,7 @@ int main() {
   }
 
   // MXFP4 (E2M1 + E8M0 block scale): the same gate set applied to the MX
-  // kernels — dequant_mx bitwise vs the host reference, fused/MMA dequant
+  // kernels: dequant_mx bitwise vs the host reference, fused/MMA dequant
   // bitwise through w_out, GEMM vs the FP64 oracle at 1e-3, vs cuBLAS at
   // 2e-3. The gs column of cfgs is unused here: the MX block is fixed at
   // 32, and K in {72, 100, 104, 40} exercises partial blocks and ragged
@@ -471,7 +471,7 @@ int main() {
                   c.K, rel_mx);
     }
 
-    // MX dispatcher: same gates as the W4 dispatch — hook bitwise, output
+    // MX dispatcher: same gates as the W4 dispatch: hook bitwise, output
     // memcmp against the callee the crossover selects.
     w4::gpu::gemm_mx(dp, x_d, c_f, c.M, 0, w_d);
     w4::gpu::cuda_check(cudaDeviceSynchronize(), "mx dispatch w_out sync");
@@ -1327,7 +1327,7 @@ int main() {
   }
 
   // Prefix sharing: one physical pool holds sequence B (S2 positions) and
-  // its own prefix A (S1 < S2) — A's block table is a prefix of B's. Both
+  // its own prefix A (S1 < S2): A's block table is a prefix of B's. Both
   // decode correctly out of the single shared pool, bitwise vs their
   // contiguous references.
   {
@@ -1468,7 +1468,7 @@ int main() {
                     relA);
       }
       // The share is structural: the pool holds B's ceil(S2/page) pages and
-      // A added none — its 200 positions are read out of B's prefix pages.
+      // A added none: its 200 positions are read out of B's prefix pages.
 
       cudaFree(qk_d);
       cudaFree(qv_d);
@@ -1577,7 +1577,7 @@ int main() {
     }
     // gridDim.y caps at 65535: with mtile 4 the launcher must reject
     // M > 262140 before any allocation or launch. Only the throw side is
-    // testable here — a passing M would launch against the dummy pointers.
+    // testable here: a passing M would launch against the dummy pointers.
     expect(throws_invalid([&] { w4::gpu::gemm_fused(good, out, out, 262141); }),
            "fused M past grid.y bound");
     // The x pre-pass launches ceil(M*K/256) on gridDim.x: M at the grid.y
@@ -1754,8 +1754,8 @@ int main() {
                [&] { w4::gpu::attention_fp16(out, out, out, out, 1, 4, 513); }),
            "kv fp16 D bound");
     // Flash entry contracts: dims, the D shared bound, gs/G, nulls, and the
-    // tile-grid S bound (65535 * 256). S > 4096 alone must NOT throw here —
-    // that is the point of the flash path — so only the tile bound is
+    // tile-grid S bound (65535 * 256). S > 4096 alone must NOT throw here:
+    // that is the point of the flash path. Only the tile bound is
     // tested for rejection.
     expect(throws_invalid([&] { w4::gpu::attention_w4_flash(kv_s0, out, out); }),
            "kv flash S=0");

@@ -2,15 +2,15 @@
 
 // MXFP4 GPU kernels (R4): naive dequant for the two-pass baseline, fused
 // dequant+GEMM, and fused dequant+WMMA GEMM. The dequant step is
-// dequant_one_mx (LUT + exponent shift, no zero-point); everything else —
-// thread mapping, x staging, dispatch, store guards — follows the W4
-// skeletons in fused.cuh / mma.cuh, which stay untouched.
+// dequant_one_mx (LUT + exponent shift, no zero-point); everything else
+// follows the W4 skeletons in fused.cuh / mma.cuh, which stay untouched:
+// thread mapping, x staging, dispatch, store guards.
 //
 // Scale layout: one E8M0 byte per (row, 32-element block). Words hold 8
 // nibbles along K and 32 % 8 == 0, so a packed word never straddles a block
 // boundary and the scale index of word w is w / 4.
 //
-// w_out (test hook): same contract as the W4 kernels — when non-null the
+// w_out (test hook): same contract as the W4 kernels: when non-null the
 // fused/MMA kernels also store each dequantized weight, reproducing
 // dequant_all_mx bitwise; racy-but-byte-identical across repeated m-tiles.
 

@@ -1,7 +1,7 @@
 #pragma once
 
 // SIMT/MMA dispatcher (R8): one host-side branch picks the kernel per call.
-// The crossover is measured, not argued — the pinned three-way run of record
+// The crossover is measured, not argued: the pinned three-way run of record
 // (2026-11-04, bench_fused): SIMT leads decode shapes through M=8 (2.29x /
 // 2.87x at M=8 vs MMA's 1.35x / 1.92x, N=4096 / N=14336); MMA is within
 // noise at M=16/N=4096 (1.38x vs SIMT's 1.37x) and leads from there

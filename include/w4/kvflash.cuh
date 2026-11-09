@@ -6,7 +6,7 @@
 // phase 1 (one block per (head, tile)) computes the tile max, tile sum, and
 // the tile's weighted V accumulation; phase 2 (one block per head) rescales
 // and combines the partials. Nothing per-S lives in shared memory, so S is
-// bounded only by the grid (65535 tiles) — and the grid is H x tiles, so
+// bounded only by the grid (65535 tiles). The grid is H x tiles, so
 // the H=8 occupancy problem of the single-block-per-head kernel is gone
 // too (8 x tiles blocks instead of 8).
 //
@@ -288,7 +288,7 @@ __global__ void flash_fp16_phase1(const __half* __restrict__ q,
 }
 
 // Phase 2 (shared by both cache types): per head, rescale and combine the
-// tile partials. exp(m_t - M) is recomputed per (d, tile) — T is small
+// tile partials. exp(m_t - M) is recomputed per (d, tile): T is small
 // against D at decode shapes, and the shared-staged variant is a measured
 // question, not a guessed one.
 __global__ void flash_phase2(const float* __restrict__ part,
@@ -590,7 +590,7 @@ inline void attention_f8_flash(const DeviceKVF8& p, const __half* q,
 }
 
 // Paged W4 flash (R7): the same split-S structure, with positions resolved
-// through the block table — logical position t lives at physical row
+// through the block table: logical position t lives at physical row
 // bt[t/page]*page + t%page of the head's pool slab (npages*page rows per
 // head). Tiles partition the LOGICAL range, so every position is still
 // touched exactly once and the k_out/v_out hooks reproduce the contiguous

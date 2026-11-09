@@ -94,7 +94,7 @@ int main() {
   }
 
   // Validation contracts: malformed input must throw, never quantize
-  // silently. NaN is the dangerous one — std::min/max swallow it.
+  // silently. NaN is the dangerous one: std::min/max swallow it.
   {
     auto throws_invalid = [](auto&& f) {
       try {

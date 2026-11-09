@@ -2,8 +2,8 @@
 
 // MXFP4 (OCP microscaling) packed format, host quantizer, and reference
 // dequant. This is NOT the W4 affine scheme: elements are E2M1 minifloats
-// (1 sign, 2 exponent, 1 mantissa — a 16-entry value table, no zero-point)
-// and the shared scale is E8M0 (8 exponent bits, no mantissa — a pure power
+// (1 sign, 2 exponent, 1 mantissa: a 16-entry value table, no zero-point)
+// and the shared scale is E8M0 (8 exponent bits, no mantissa: a pure power
 // of two) per block of 32 elements. Dequant is a table lookup times an
 // exponent shift, so the product is exact in float and the only rounding is
 // the final round-to-nearest half conversion.
@@ -15,7 +15,7 @@
 //   dequant: w = 2^(e-127) * e2m1[q]
 //
 // Quantizer rule: e = ceil(log2(amax / 6)), clamped to [-127, 127], so
-// amax / scale <= 6 by construction — no element ever saturates to the
+// amax / scale <= 6 by construction: no element ever saturates to the
 // endstop code. The floor variant (full range use, saturating the block
 // max) is the noted alternative; we take the no-saturation side.
 // amax == 0 quantizes to scale 2^0 with all-zero codes. A block whose amax

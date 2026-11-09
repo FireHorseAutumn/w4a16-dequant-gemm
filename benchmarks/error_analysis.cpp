@@ -1,6 +1,6 @@
 // Error-analysis measurements behind ERROR_ANALYSIS.md. Host-only,
 // deterministic seeds; prints the tables. Everything here is a value
-// measurement, not a timing — machine state does not touch the numbers.
+// measurement, not a timing: machine state does not touch the numbers.
 //
 //   A. Quantizer rel L2 vs group size (W4 sym/asym, MXFP4), Gaussian.
 //   B. Where the error lives: absolute and relative error binned by
@@ -9,7 +9,7 @@
 //   D. Distribution shape: Gaussian vs Laplace vs uniform, gs=128 sym.
 //   E. End-to-end GEMM error vs the FP16 reference, K in {256, 1024,
 //      4096}: the quantized W is promoted exactly to FP64, so the
-//      measured gap is quantization only — no accumulation noise.
+//      measured gap is quantization only: no accumulation noise.
 
 #include <algorithm>
 #include <cmath>

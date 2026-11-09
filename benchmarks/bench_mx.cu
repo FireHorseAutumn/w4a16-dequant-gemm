@@ -8,7 +8,7 @@
 //
 // Each case also records the format-accuracy figure: rel L2 of
 // dequant(quant(W)) vs the FP64 source weights, for MXFP4 and for W4A16
-// gs=128 symmetric — the two formats' price of admission on identical
+// gs=128 symmetric: the two formats' price of admission on identical
 // data. This is a quantization-error figure, not a GEMM gate; the GEMM
 // gates (bitwise dequant, oracle tolerances) live in test_gpu.
 //

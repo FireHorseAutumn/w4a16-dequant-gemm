@@ -1,8 +1,8 @@
 #pragma once
 
-// Fused dequant + WMMA GEMM (R3). Same contract as the SIMT fused kernel —
-// packed weights dequantized via dequant_one, never materialize in DRAM —
-// but the multiply runs on tensor cores. The SIMT R2 kernel hits its wall at
+// Fused dequant + WMMA GEMM (R3). Same contract as the SIMT fused kernel:
+// packed weights dequantized via dequant_one, never materialize in DRAM.
+// But the multiply runs on tensor cores. The SIMT R2 kernel hits its wall at
 // M=64: N*M*K FP32 FMAs on CUDA cores, W re-read per m-tile, and x L2
 // traffic. Fragment MMA removes all three at once: the M=64 tile is one
 // m-tile (W read exactly once), the FMA floor drops to the tensor-core
@@ -17,7 +17,7 @@
 // fragments never write out of bounds.
 //
 // cp.async pipeline (R3.6): chunk staging rides cp.async straight into
-// shared — the x tile lands without a register round trip, and the packed
+// shared: the x tile lands without a register round trip, and the packed
 // W words land in qs and pay a shared round trip through the dequant.
 // Scales/zeros still ride registers, prefetched at issue time. Issue runs
 // two chunks ahead of the MMA: xs is three slots deep (the issued slot, the
@@ -26,7 +26,7 @@
 // and staged x and retires the previous MMA before its slots recycle; the
 // next chunk's dequant sits between issue and MMA under no barrier of its
 // own, so warps interleave dequant ALU with tensor-core work. qs needs no
-// barrier at all — each word is read only by the thread that staged it, and
+// barrier at all: each word is read only by the thread that staged it, and
 // cp.async.wait_group covers the issuing thread. cp.async wants a 4-byte
 // aligned source, which x rows only guarantee at even K; odd-K or
 // misaligned x falls back to the guarded scalar stores, same staged values.
@@ -36,16 +36,16 @@
 // x-staging footprint; a narrower N tile halves W work per chunk while x
 // staging stays fixed) and the rejection predates pipelining; register
 // prefetch (R3.5) measured flat at N=4096 and +4-6% at N=14336 unpinned;
-// this cp.async restructure measured parity with R3.5 unpinned — three
+// this cp.async restructure measured parity with R3.5 unpinned: three
 // staging designs within noise at 25-45 GB/s effective, so the binding
 // constraint is not the global-load path.
 //
 // x stays FP16 and is read from global through the xs stage (L2-resident at
-// decode shapes) — the FP32 pre-pass of the SIMT kernel was only there to
+// decode shapes). The FP32 pre-pass of the SIMT kernel was only there to
 // dodge per-FMA converts, which fragment loads do in hardware.
 //
 // w_out (test hook): the dequant step also stores each weight it produces,
-// reproducing dequant_all bitwise — same racy-but-identical semantics as
+// reproducing dequant_all bitwise: same racy-but-identical semantics as
 // the SIMT kernel when m-tiles repeat (M > 64).
 
 #include <cuda_fp16.h>
@@ -92,8 +92,8 @@ __global__ void mma_kernel(const DevicePackedW p,
       (p.K % 2 == 0) && ((reinterpret_cast<uintptr_t>(x) & 3) == 0);
 
   // Issue chunk ch: this thread's packed word plus a quarter of the x tile
-  // (four 4-byte pairs). Invalid W words skip the copy — the dequant never
-  // reads them — and out-of-range x pairs take guarded scalar stores.
+  // (four 4-byte pairs). Invalid W words skip the copy: the dequant never
+  // reads them. Out-of-range x pairs take guarded scalar stores.
   auto stage_chunk = [&](int ch) {
     const int w = ch * (MMA_CHUNK_K / 8) + wq;
     const int n = n0 + nl;
