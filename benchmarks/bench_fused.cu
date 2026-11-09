@@ -92,7 +92,8 @@ double median(std::vector<double> v) {
   return n % 2 ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
 }
 
-// Mirrors the MTILE choice in gemm_fused's launcher (pow2(M) capped at 4).
+// Mirrors the MTILE choice in gemm_fused's launcher (pow2-ceil(M) capped
+// at 4).
 int mtile_of(int M) {
   int mtile = 1;
   while (mtile < M && mtile < 4) mtile <<= 1;

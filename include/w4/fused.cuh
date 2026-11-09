@@ -21,7 +21,7 @@
 // stride 8 k's apart, and a lane stride of 8 floats is 4-way
 // bank-conflicted under any padding.
 //
-// Dispatch (measured): M <= 4 -> MTILE = pow2(M), R = 1; M > 4 ->
+// Dispatch (measured): M <= 4 -> MTILE = pow2-ceil(M), R = 1; M > 4 ->
 // MTILE = 4, R = 4. MTILE 8+/R 1 loses on x traffic; MTILE 16 (94 regs)
 // halves occupancy; MTILE 32 (148 regs) and 64 (255, spills) lose the W
 // savings to occupancy and local memory.
